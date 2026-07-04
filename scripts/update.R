@@ -56,6 +56,20 @@ default_io <- function() {
 # CLI entry point
 # ---------------------------------------------------------------------------
 if (identical(sys.nframe(), 0L)) {
+  # Running standalone via Rscript. Source the sibling modules that define the
+  # config constants and pipeline functions. The test harness sources these
+  # itself, so this block only runs when update.R is invoked as a script.
+  script_dir <- tryCatch(
+    dirname(sys.frame(1)$ofile),
+    error = function(e) {
+      a <- commandArgs(FALSE)
+      f <- sub("--file=", "", grep("--file=", a, value = TRUE))
+      if (length(f) == 1L && nzchar(f)) dirname(f) else "scripts"
+    }
+  )
+  for (s in c("config.R", "sources.R", "coverage.R", "export.R")) {
+    source(file.path(script_dir, s))
+  }
   args <- commandArgs(trailingOnly = TRUE)
   out_dir <- if (length(args) >= 1L) args[[1]] else "out"
   run_shard(default_io(), out_dir)
