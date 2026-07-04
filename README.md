@@ -17,10 +17,13 @@ object tarballs.
 ## Determinism
 
 en_US.UTF-8 locale, UTC, single-threaded, NOT_CRAN=true, all Suggests
-installed best-effort, fixed recorded RNG seed. Every row in
-`coverage_summary` also records the exact R, covr, and gcov versions, the
-locale, and the seed used to produce it, so any coverage number can be traced
-back to the environment that made it.
+installed best-effort, and a recorded RNG seed. covr runs a package's own
+tests in subprocesses, so the seed set in the driving R session does not by
+itself pin the coverage number; it is recorded for provenance, not as a
+determinism guarantee. Every row in `coverage_summary` also records the
+exact R, covr, and gcov versions, the locale, and the seed used to produce
+it, so any coverage number can be traced back to the environment that made
+it.
 
 ## Run
 

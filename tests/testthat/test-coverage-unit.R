@@ -29,3 +29,16 @@ test_that("run_unit_dir classifies a failing test suite as test_error, not ok", 
   expect_true(nzchar(res$summary$fail_reason))
   expect_false(is.na(res$summary$line_pct))
 })
+
+test_that("run_unit_dir classifies a hanging test suite as timeout, not a deadlock", {
+  skip_if_not_installed("covr"); skip_if_not_installed("testthat")
+  skip_if_not_installed("R.utils")
+  pkg <- make_hanging_pkg()               # defined in helper-fixture.R
+  res <- run_unit_dir("covhang", "1.0", pkg, timeout_s = 2)
+  expect_identical(res$summary$covr_status, "timeout")
+  expect_false(res$summary$tests_passed)
+  expect_true(is.character(res$summary$fail_reason))
+  expect_true(nzchar(res$summary$fail_reason))
+  expect_true(is.na(res$summary$line_pct))
+  expect_null(res$raw)
+})

@@ -12,8 +12,8 @@ apply_determinism <- function(seed = COVERAGE_SEED) {
   )
   options(mc.cores = 1L, Ncpus = 1L, covr.gcov = Sys.which("gcov"))
   suppressWarnings(try(Sys.setlocale("LC_ALL", "en_US.UTF-8"), silent = TRUE))
-  set.seed(seed)
   RNGkind("Mersenne-Twister", "Inversion", "Rejection")
+  set.seed(seed)
   coverage_fingerprint(seed)
 }
 
@@ -29,8 +29,6 @@ coverage_fingerprint <- function(seed = COVERAGE_SEED) {
   )
 }
 
-# --- extractors (append to scripts/coverage.R) ---
-
 .is_compiled_file <- function(filename) {
   grepl("^src/", filename) |
     grepl("\\.(c|cc|cpp|cxx|h|hpp|f|f90|f95)$", filename, ignore.case = TRUE)
@@ -43,6 +41,14 @@ coverage_fingerprint <- function(seed = COVERAGE_SEED) {
   df
 }
 
+#' Per-physical-line tally for the R portion of a coverage object: one row
+#' per line (not per traced expression), via covr::tally_coverage(by =
+#' "line"), with the compiled (src/*.c etc.) files filtered out.
+.r_line_tally <- function(cov) {
+  tl <- covr::tally_coverage(cov, by = "line")
+  tl[!.is_compiled_file(tl$filename), , drop = FALSE]
+}
+
 #' One-row summary. True line counts (from a per-line tally), true expression
 #' counts (from the traced-expression data frame), line/expression
 #' percentages, and the compiled split.
@@ -52,8 +58,7 @@ summarise_coverage <- function(cov) {
   cc <- df[df$is_compiled, , drop = FALSE]
   pct <- function(x) if (nrow(x) == 0L) NA_real_ else round(100 * mean(x$covered), 4)
 
-  tl <- covr::tally_coverage(cov, by = "line")
-  tl <- tl[!.is_compiled_file(tl$filename), , drop = FALSE]
+  tl <- .r_line_tally(cov)
   lines_covered <- sum(tl$value > 0)
 
   data.frame(
@@ -67,7 +72,6 @@ summarise_coverage <- function(cov) {
     expr_total             = nrow(r),
     expr_covered           = sum(r$covered),
     expr_missed            = nrow(r) - sum(r$covered),
-    zero_coverage_lines    = nrow(tl) - lines_covered,
     compiled_line_pct      = pct(cc),
     compiled_lines_total   = nrow(cc),
     compiled_lines_covered = sum(cc$covered),
@@ -75,45 +79,54 @@ summarise_coverage <- function(cov) {
   )
 }
 
-#' Per-file coverage.
+#' Per-file coverage. True physical line counts (see .r_line_tally): a line
+#' with any covered expression on it counts as covered once, not once per
+#' traced expression that falls on that line.
 file_coverage <- function(cov) {
-  df <- .cov_df(cov)
-  agg <- stats::aggregate(covered ~ filename, df, function(x) c(sum(x), length(x)))
+  tl <- .r_line_tally(cov)
+  if (nrow(tl) == 0L) {
+    return(data.frame(file = character(), lines_covered = integer(),
+                      lines_total = integer(), coverage_pct = numeric(),
+                      stringsAsFactors = FALSE))
+  }
+  agg <- stats::aggregate(value ~ filename, tl, function(x) c(sum(x > 0), length(x)))
   data.frame(
     file          = agg$filename,
-    lines_covered = agg$covered[, 1],
-    lines_total   = agg$covered[, 2],
-    coverage_pct  = round(100 * agg$covered[, 1] / agg$covered[, 2], 4),
+    lines_covered = agg$value[, 1],
+    lines_total   = agg$value[, 2],
+    coverage_pct  = round(100 * agg$value[, 1] / agg$value[, 2], 4),
     stringsAsFactors = FALSE
   )
 }
 
-#' Per-function coverage. Joined on (file, label). covr labels S4 methods by
-#' signature and R6/RC methods by bare name; we keep the label verbatim and
-#' also carry the file so downstream reconciliation with the analyzer is
-#' possible, and we never assume a 1:1 name match.
+#' Per-function coverage. Joined on (file, label) using the `functions`
+#' column from the same per-line tally (see .r_line_tally), so line counts
+#' here agree with file_coverage and summarise_coverage. covr labels S4
+#' methods by signature and R6/RC methods by bare name; we keep the label
+#' verbatim and also carry the file so downstream reconciliation with the
+#' analyzer is possible, and we never assume a 1:1 name match.
 function_coverage <- function(cov) {
-  df <- .cov_df(cov)
-  df <- df[!is.na(df$functions) & nzchar(df$functions), , drop = FALSE]
-  if (nrow(df) == 0L) {
+  tl <- .r_line_tally(cov)
+  tl <- tl[!is.na(tl$functions) & nzchar(tl$functions), , drop = FALSE]
+  if (nrow(tl) == 0L) {
     return(data.frame(file = character(), label = character(),
                       lines_total = integer(), lines_covered = integer(),
                       coverage_pct = numeric(), stringsAsFactors = FALSE))
   }
-  key <- paste(df$filename, df$functions, sep = "\x1f")
-  agg <- stats::aggregate(covered ~ key, df, function(x) c(sum(x), length(x)))
+  key <- paste(tl$filename, tl$functions, sep = "\x1f")
+  agg <- stats::aggregate(value ~ key, tl, function(x) c(sum(x > 0), length(x)))
   parts <- do.call(rbind, strsplit(agg$key, "\x1f", fixed = TRUE))
   data.frame(
     file          = parts[, 1],
     label         = parts[, 2],
-    lines_covered = agg$covered[, 1],
-    lines_total   = agg$covered[, 2],
-    coverage_pct  = round(100 * agg$covered[, 1] / agg$covered[, 2], 4),
+    lines_covered = agg$value[, 1],
+    lines_total   = agg$value[, 2],
+    coverage_pct  = round(100 * agg$value[, 1] / agg$value[, 2], 4),
     stringsAsFactors = FALSE
   )
 }
 
-# --- unit runner (append to scripts/coverage.R) ---
+# Per-package unit runner: install, run covr, classify the outcome.
 
 .has_tests <- function(pkgdir) {
   tt <- file.path(pkgdir, "tests")
@@ -150,8 +163,8 @@ function_coverage <- function(cov) {
 #' (caught by tryCatch(error =)), not a warning: a package with failing tests
 #' does NOT come back from package_coverage() as a normal return value, so
 #' treating "no R error" as "tests passed" silently misreports failing suites
-#' as ok. Confirmed empirically (see task-5-report.md) with a fixture package
-#' whose test asserts a wrong value: package_coverage() throws, and
+#' as ok. Confirmed empirically with a fixture package whose test asserts a
+#' wrong value: package_coverage() throws, and
 #' `inherits(e, "covr_error")` is TRUE, versus a plain "simpleError" for a
 #' genuine build/install failure (for example a source file that fails to
 #' parse).
@@ -198,8 +211,13 @@ function_coverage <- function(cov) {
     any(grepl("test.*fail|fail.*test|FAIL\\s+[1-9]", msgs, ignore.case = TRUE))
 }
 
-#' Run covr over an already-extracted package directory.
-run_unit_dir <- function(package, version, pkgdir) {
+#' Run covr over an already-extracted package directory. `timeout_s` bounds
+#' each covr::package_coverage() call (the "tests" run and each by-type
+#' run); a package that hangs (an infinite loop, a blocking network call, a
+#' test that never returns) is recorded as covr_status = "timeout" instead
+#' of hanging the whole shard forever. Defaults to the pipeline-wide
+#' PER_UNIT_TIMEOUT_S but can be overridden, for example in tests.
+run_unit_dir <- function(package, version, pkgdir, timeout_s = PER_UNIT_TIMEOUT_S) {
   fp <- apply_determinism()
   t0 <- proc.time()[["elapsed"]]
   base <- data.frame(
@@ -239,19 +257,27 @@ run_unit_dir <- function(package, version, pkgdir) {
   test_warnings <- character(0)
   cov <- tryCatch(
     withCallingHandlers(
-      covr::package_coverage(pkgdir, type = "tests", quiet = TRUE,
-                             clean = FALSE, install_path = install_path),
+      R.utils::withTimeout(
+        covr::package_coverage(pkgdir, type = "tests", quiet = TRUE,
+                               clean = FALSE, install_path = install_path),
+        timeout = timeout_s, onTimeout = "error"
+      ),
       warning = function(w) {
         test_warnings <<- c(test_warnings, conditionMessage(w))
         invokeRestart("muffleWarning")
       }
     ),
     error = function(e) structure(
-      list(msg = conditionMessage(e), is_test_failure = inherits(e, "covr_error")),
+      list(msg = conditionMessage(e), is_test_failure = inherits(e, "covr_error"),
+           is_timeout = inherits(e, "TimeoutException")),
       class = "cov_err")
   )
 
   if (inherits(cov, "cov_err")) {
+    if (isTRUE(cov$is_timeout)) {
+      return(finish("timeout", tests_passed = FALSE,
+                    extra = list(fail_reason = substr(cov$msg, 1, 300))))
+    }
     if (isTRUE(cov$is_test_failure)) {
       recovered <- .recover_partial_coverage(pkgdir, install_path, package, version)
       extra <- list(fail_reason = substr(cov$msg, 1, 300))
@@ -291,8 +317,13 @@ run_unit_dir <- function(package, version, pkgdir) {
   fcv <- file_coverage(cov)
   fnv <- function_coverage(cov)
   # by-type: examples and vignettes reinstall the target; keep them separate.
+  # Bounded by the same timeout as the tests run, since these also invoke
+  # package code (rendering vignettes, running examples) that can hang.
   type_pct <- function(tp) tryCatch(
-    round(covr::percent_coverage(covr::package_coverage(pkgdir, type = tp, quiet = TRUE), by = "line"), 4),
+    round(covr::percent_coverage(
+      R.utils::withTimeout(covr::package_coverage(pkgdir, type = tp, quiet = TRUE),
+                           timeout = timeout_s, onTimeout = "error"),
+      by = "line"), 4),
     error = function(e) NA_real_)
   extra <- as.list(s)
   extra$coverage_tests_pct     <- s$line_pct
