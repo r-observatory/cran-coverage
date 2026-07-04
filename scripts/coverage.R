@@ -142,6 +142,49 @@ function_coverage <- function(cov) {
   failed_soft
 }
 
+#' covr's package_coverage() installs the package with tracing hooks and then
+#' runs `tools::testInstalledPackage(..., types = "tests")`. When a test file
+#' fails or errors, that returns a non-zero result and covr calls its internal
+#' `show_failures()`, which raises a condition classed "covr_error" whose
+#' message is the tail of the failing Rout file. That is a genuine R error
+#' (caught by tryCatch(error =)), not a warning: a package with failing tests
+#' does NOT come back from package_coverage() as a normal return value, so
+#' treating "no R error" as "tests passed" silently misreports failing suites
+#' as ok. Confirmed empirically (see task-5-report.md) with a fixture package
+#' whose test asserts a wrong value: package_coverage() throws, and
+#' `inherits(e, "covr_error")` is TRUE, versus a plain "simpleError" for a
+#' genuine build/install failure (for example a source file that fails to
+#' parse).
+#'
+#' The coverage trace files that back the line/function counts are written
+#' to `install_path` before `show_failures()` is reached, so if
+#' package_coverage() is called with `clean = FALSE` and an install_path we
+#' control, those trace files are still on disk after the error propagates.
+#' `.recover_partial_coverage()` rebuilds a coverage object from them so a
+#' failing test run still yields real coverage numbers instead of NA.
+.recover_partial_coverage <- function(pkgdir, install_path) {
+  tryCatch({
+    trace_files <- list.files(install_path, pattern = "^covr_trace_",
+                              full.names = TRUE, recursive = TRUE)
+    if (length(trace_files) == 0L) return(NULL)
+    merged <- covr:::merge_coverage(trace_files)
+    pkg    <- covr:::as_package(pkgdir)
+    cov    <- covr:::as_coverage(merged, package = pkg, root = pkgdir)
+    covr:::exclude(cov, line_exclusions = c("src/RcppExports.cpp",
+                    "R/RcppExports.R", "src/cpp11.cpp", "R/cpp11.R"),
+                   path = pkgdir)
+  }, error = function(e) NULL)
+}
+
+#' Defensive secondary signal: if some covr/testthat combination ever reports
+#' a failed test file as a warning rather than an error (not observed in the
+#' r2u environment this pipeline targets, but cheap to guard against), treat
+#' it the same way as the error path.
+.warn_is_test_failure <- function(msgs) {
+  length(msgs) > 0 &&
+    any(grepl("test.*fail|fail.*test|FAIL\\s+[1-9]", msgs, ignore.case = TRUE))
+}
+
 #' Run covr over an already-extracted package directory.
 run_unit_dir <- function(package, version, pkgdir) {
   fp <- apply_determinism()
@@ -168,13 +211,67 @@ run_unit_dir <- function(package, version, pkgdir) {
 
   failed_soft <- tryCatch(.install_deps(pkgdir), error = function(e) NULL)
 
+  # clean = FALSE and an install_path we control let us recover coverage
+  # traces after a test-failure error (see .recover_partial_coverage above).
+  # We take over the cleanup covr would otherwise have done itself.
+  install_path <- tempfile("covr_lib_")
+  dir.create(install_path, showWarnings = FALSE)
+  on.exit({
+    unlink(install_path, recursive = TRUE, force = TRUE)
+    try(covr:::clean_objects(pkgdir), silent = TRUE)
+    try(covr:::clean_gcov(pkgdir), silent = TRUE)
+    try(covr:::clean_parse_data(), silent = TRUE)
+  }, add = TRUE)
+
+  test_warnings <- character(0)
   cov <- tryCatch(
-    covr::package_coverage(pkgdir, type = "tests", quiet = TRUE),
-    error = function(e) structure(list(msg = conditionMessage(e)), class = "cov_err")
+    withCallingHandlers(
+      covr::package_coverage(pkgdir, type = "tests", quiet = TRUE,
+                             clean = FALSE, install_path = install_path),
+      warning = function(w) {
+        test_warnings <<- c(test_warnings, conditionMessage(w))
+        invokeRestart("muffleWarning")
+      }
+    ),
+    error = function(e) structure(
+      list(msg = conditionMessage(e), is_test_failure = inherits(e, "covr_error")),
+      class = "cov_err")
   )
+
   if (inherits(cov, "cov_err")) {
+    if (isTRUE(cov$is_test_failure)) {
+      recovered <- .recover_partial_coverage(pkgdir, install_path)
+      extra <- list(fail_reason = substr(cov$msg, 1, 300))
+      if (!is.null(recovered)) {
+        rs <- summarise_coverage(recovered)
+        for (n in names(rs)) extra[[n]] <- rs[[n]]
+        extra$coverage_tests_pct <- rs$line_pct
+      }
+      out <- finish("test_error", tests_passed = FALSE, extra = extra)
+      if (!is.null(recovered)) {
+        out$file <- cbind(package = package, version = version, file_coverage(recovered))
+        out$func <- cbind(package = package, version = version, function_coverage(recovered))
+        out$raw  <- serialize(recovered, connection = NULL)
+      }
+      return(out)
+    }
     status <- if (grepl("compilation failed|non-zero exit", cov$msg)) "build_fail" else "covr_error"
     return(finish(status, extra = list(fail_reason = substr(cov$msg, 1, 300))))
+  }
+
+  if (.warn_is_test_failure(test_warnings)) {
+    s   <- summarise_coverage(cov)
+    fcv <- file_coverage(cov)
+    fnv <- function_coverage(cov)
+    extra <- as.list(s)
+    extra$coverage_tests_pct <- s$line_pct
+    bad <- test_warnings[grepl("test.*fail|fail.*test|FAIL\\s+[1-9]", test_warnings, ignore.case = TRUE)]
+    extra$fail_reason <- substr(bad[1], 1, 300)
+    out <- finish("test_error", tests_passed = FALSE, extra = extra)
+    out$file <- cbind(package = package, version = version, fcv)
+    out$func <- cbind(package = package, version = version, fnv)
+    out$raw  <- serialize(cov, connection = NULL)
+    return(out)
   }
 
   s   <- summarise_coverage(cov)
