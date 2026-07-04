@@ -48,11 +48,8 @@ jobs:
           set -uo pipefail
           BUDGET="${{ inputs.time_budget_seconds || '18000' }}"
           if ! GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release view current >/dev/null 2>&1; then
-            AUTH=$(printf 'x-access-token:%s' "${{ secrets.GITHUB_TOKEN }}" | base64 | tr -d '\n')
-            git tag -f current
-            git -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${AUTH}" \
-              push -f origin current || true
             GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release create current \
+              --target "$GITHUB_SHA" \
               --title "CRAN Coverage (rolling)" \
               --notes "Latest-version test coverage for CRAN packages." --latest
           fi
