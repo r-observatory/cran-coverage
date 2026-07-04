@@ -17,6 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     container: rocker/r2u:noble
     timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
