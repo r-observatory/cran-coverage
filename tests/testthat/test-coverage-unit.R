@@ -30,15 +30,24 @@ test_that("run_unit_dir classifies a failing test suite as test_error, not ok", 
   expect_false(is.na(res$summary$line_pct))
 })
 
-test_that("run_unit_dir classifies a hanging test suite as timeout, not a deadlock", {
+test_that("run_unit_dir classifies a hanging test suite as timeout, killed near the deadline, not a deadlock", {
   skip_if_not_installed("covr"); skip_if_not_installed("testthat")
-  skip_if_not_installed("R.utils")
-  pkg <- make_hanging_pkg()               # defined in helper-fixture.R
-  res <- run_unit_dir("covhang", "1.0", pkg, timeout_s = 2)
+  skip_if_not_installed("callr")
+  pkg <- make_hanging_pkg()               # defined in helper-fixture.R; sleeps 120s
+  timeout_s <- 5
+  elapsed <- system.time(
+    res <- run_unit_dir("covhang", "1.0", pkg, timeout_s = timeout_s)
+  )[["elapsed"]]
   expect_identical(res$summary$covr_status, "timeout")
   expect_false(res$summary$tests_passed)
   expect_true(is.character(res$summary$fail_reason))
   expect_true(nzchar(res$summary$fail_reason))
   expect_true(is.na(res$summary$line_pct))
   expect_null(res$raw)
+  # Proves the subprocess was actually killed near the timeout deadline,
+  # not waited out until the fixture's 120s sleep completed: a cooperative
+  # timeout (R.utils::withTimeout/setTimeLimit) cannot interrupt covr's
+  # shelled-out test run, so this elapsed-time bound is what the prior
+  # (broken) fix lacked and could not have passed.
+  expect_lt(elapsed, timeout_s + 20)
 })

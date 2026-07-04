@@ -19,12 +19,14 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: System + R dependencies
         run: |
           apt-get update -qq
           apt-get install -y --no-install-recommends git curl gh jq \
             r-cran-covr r-cran-testthat r-cran-dbi r-cran-rsqlite r-cran-jsonlite \
-            r-cran-r.utils pkg-config libcurl4-openssl-dev libssl-dev libxml2-dev
+            r-cran-callr pkg-config libcurl4-openssl-dev libssl-dev libxml2-dev
       - name: Download the prior database
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -43,7 +45,10 @@ jobs:
           set -uo pipefail
           BUDGET="${{ inputs.time_budget_seconds || '18000' }}"
           if ! GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release view current >/dev/null 2>&1; then
-            git tag -f current && git push -f origin current || true
+            AUTH=$(printf 'x-access-token:%s' "${{ secrets.GITHUB_TOKEN }}" | base64 | tr -d '\n')
+            git tag -f current
+            git -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${AUTH}" \
+              push -f origin current || true
             GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release create current \
               --title "CRAN Coverage (rolling)" \
               --notes "Latest-version test coverage for CRAN packages." --latest
