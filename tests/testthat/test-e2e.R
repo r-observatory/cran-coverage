@@ -1,0 +1,13 @@
+test_that("run_unit on a real tiny package yields a number (network, slow)", {
+  skip_on_cran(); skip_if_offline()
+  skip_if_not_installed("covr")
+  wd <- tempfile("e2e_"); dir.create(wd)
+  on.exit(unlink(wd, recursive = TRUE, force = TRUE))
+  db <- available.packages(repos = "https://cloud.r-project.org")
+  v <- latest_version("tinytest", db)
+  skip_if(is.na(v))
+  res <- run_unit("tinytest", v, wd)
+  expect_true(res$summary$covr_status %in% c("ok", "no_tests", "test_error"))
+  if (identical(res$summary$covr_status, "ok"))
+    expect_true(is.numeric(res$summary$line_pct) && res$summary$line_pct >= 0)
+})

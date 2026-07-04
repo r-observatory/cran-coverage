@@ -1,0 +1,21 @@
+name: Test
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: rocker/r2u:noble
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install R deps + covr
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends r-cran-covr r-cran-testthat \
+            r-cran-dbi r-cran-rsqlite r-cran-jsonlite r-cran-callr pkg-config \
+            libcurl4-openssl-dev libssl-dev
+      - name: Run unit tests
+        run: Rscript tests/testthat.R

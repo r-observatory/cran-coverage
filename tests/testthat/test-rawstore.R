@@ -1,0 +1,10 @@
+test_that("raw objects partition and bundle", {
+  expect_identical(raw_partition("dplyr"), "d")
+  expect_identical(raw_partition("4ti2"), "0")
+  d <- tempfile("raw_"); dir.create(d)
+  out <- tempfile("bundle_"); dir.create(out)
+  write_raw_object(d, "dplyr", "1.1.4", serialize(1:3, NULL))
+  expect_true(file.exists(file.path(d, "d", "dplyr_1.1.4.rds")))
+  bundle_partitions(d, out)
+  expect_true(file.exists(file.path(out, "covr-raw-d.tar.gz")))
+})
