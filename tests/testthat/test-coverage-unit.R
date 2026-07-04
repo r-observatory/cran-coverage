@@ -4,17 +4,28 @@ test_that("run_unit classifies a package with no tests as no_tests", {
                "License: MIT"), file.path(d, "DESCRIPTION"))
   writeLines("export(f)", file.path(d, "NAMESPACE"))
   writeLines("f <- function() 1", file.path(d, "R", "f.R"))
-  res <- run_unit_dir("notest", "1.0", d)   # test-only helper over a local dir
+  res <- run_unit_dir("notest", "1.0", d)   # run_unit_dir over a local dir; run_unit delegates to it in production
   expect_identical(res$summary$covr_status, "no_tests")
   expect_true(is.na(res$summary$line_pct))
 })
 
 test_that("run_unit_dir produces ok coverage on the fixture", {
   skip_if_not_installed("covr"); skip_if_not_installed("testthat")
-  pkg <- make_fixture_pkg()               # defined in test-coverage-extract.R
+  pkg <- make_fixture_pkg()               # defined in helper-fixture.R
   res <- run_unit_dir("covfix", "1.0", pkg)
   expect_identical(res$summary$covr_status, "ok")
   expect_equal(res$summary$line_pct, 50)
   expect_true(res$summary$tests_passed)
   expect_true(is.raw(res$raw))
+})
+
+test_that("run_unit_dir classifies a failing test suite as test_error, not ok", {
+  skip_if_not_installed("covr"); skip_if_not_installed("testthat")
+  pkg <- make_failing_pkg()               # defined in helper-fixture.R
+  res <- run_unit_dir("covfail", "1.0", pkg)
+  expect_identical(res$summary$covr_status, "test_error")
+  expect_false(res$summary$tests_passed)
+  expect_true(is.character(res$summary$fail_reason))
+  expect_true(nzchar(res$summary$fail_reason))
+  expect_false(is.na(res$summary$line_pct))
 })
