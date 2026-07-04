@@ -3,6 +3,16 @@
 COVR_STATUS <- c("ok", "no_tests", "build_fail", "sysreq_fail",
                  "test_error", "timeout", "covr_error")
 
+# Repository root (absolute), captured the moment this file is sourced. By
+# convention every entry point in this pipeline (tests/testthat.R, scripts/
+# update.R) sources scripts/*.R with relative paths from the repo root, so
+# the working directory is the repo root at that moment. run_unit_dir uses
+# this to tell its callr subprocess (see .covr_subprocess) where to find
+# config.R/sources.R/coverage.R, since the working directory when
+# run_unit_dir actually runs is not reliable: testthat::test_dir() changes
+# it to each test file's own directory while that file's tests execute.
+.PIPELINE_ROOT <- normalizePath(getwd())
+
 #' Apply the deterministic environment. Idempotent. Returns fingerprint fields.
 apply_determinism <- function(seed = COVERAGE_SEED) {
   Sys.setenv(
@@ -211,12 +221,114 @@ function_coverage <- function(cov) {
     any(grepl("test.*fail|fail.*test|FAIL\\s+[1-9]", msgs, ignore.case = TRUE))
 }
 
-#' Run covr over an already-extracted package directory. `timeout_s` bounds
-#' each covr::package_coverage() call (the "tests" run and each by-type
-#' run); a package that hangs (an infinite loop, a blocking network call, a
-#' test that never returns) is recorded as covr_status = "timeout" instead
-#' of hanging the whole shard forever. Defaults to the pipeline-wide
-#' PER_UNIT_TIMEOUT_S but can be overridden, for example in tests.
+#' Executed inside a fresh `callr::r()` subprocess (see `run_unit_dir`), so
+#' covr's own shelled-out work (`tools::testInstalledPackage()`, `R CMD
+#' INSTALL`, `R CMD build` -- all driven via `system()`/`system2()`) can be
+#' killed at the OS-process level if it hangs. `R.utils::withTimeout()` /
+#' `setTimeLimit()` cannot do that: they only interrupt R's own evaluator,
+#' which never regains control while a child process is blocked in
+#' `system()`/`system2()`, so a genuinely hung package would never time out
+#' and would deadlock the whole shard. Confirmed empirically: a fixture
+#' whose test sleeps well past the configured timeout only ever returned
+#' once its own sleep finished, not at the timeout. `callr::r(timeout = )`
+#' kills the subprocess and its children instead.
+#'
+#' A fresh subprocess starts from an empty session, so this function must
+#' be self-contained: the first thing it does is re-source the pipeline
+#' scripts it needs, rather than relying on closures over the parent
+#' process, which callr cannot transport.
+#'
+#' `mode = "unit"` installs dependencies and runs the tests-type coverage
+#' pass, classifying the result exactly as before (build_fail / covr_error
+#' / test_error with recovered partial coverage / ok), and returns a plain
+#' list that `run_unit_dir` turns into its summary/file/func/raw result
+#' without touching covr internals itself.
+#'
+#' `mode = "type_pct"` runs one by-type (examples/vignettes) coverage pass
+#' and returns just its line percentage. It is its own subprocess call,
+#' bounded by the same `timeout_s` as the tests pass but run separately, so
+#' a hang while building vignettes (say) cannot erase an already-earned
+#' "ok" tests result the way folding every type into one subprocess call
+#' would.
+.covr_subprocess <- function(mode, repo_root, pkgdir,
+                            package = NULL, version = NULL, type = NULL) {
+  setwd(repo_root)
+  source("scripts/config.R")
+  source("scripts/sources.R")
+  source("scripts/coverage.R")
+  apply_determinism()
+
+  if (identical(mode, "type_pct")) {
+    return(tryCatch(
+      round(covr::percent_coverage(
+        covr::package_coverage(pkgdir, type = type, quiet = TRUE), by = "line"), 4),
+      error = function(e) NA_real_))
+  }
+
+  failed_soft <- tryCatch(.install_deps(pkgdir), error = function(e) NULL)
+
+  # clean = FALSE and an install_path we control let us recover coverage
+  # traces after a test-failure error (see .recover_partial_coverage above).
+  # We take over the cleanup covr would otherwise have done itself.
+  install_path <- tempfile("covr_lib_")
+  dir.create(install_path, showWarnings = FALSE)
+  on.exit({
+    unlink(install_path, recursive = TRUE, force = TRUE)
+    try(covr:::clean_objects(pkgdir), silent = TRUE)
+    try(covr:::clean_gcov(pkgdir), silent = TRUE)
+    try(covr:::clean_parse_data(), silent = TRUE)
+  }, add = TRUE)
+
+  test_warnings <- character(0)
+  cov <- tryCatch(
+    withCallingHandlers(
+      covr::package_coverage(pkgdir, type = "tests", quiet = TRUE,
+                             clean = FALSE, install_path = install_path),
+      warning = function(w) {
+        test_warnings <<- c(test_warnings, conditionMessage(w))
+        invokeRestart("muffleWarning")
+      }
+    ),
+    error = function(e) structure(
+      list(msg = conditionMessage(e), is_test_failure = inherits(e, "covr_error")),
+      class = "cov_err")
+  )
+
+  if (inherits(cov, "cov_err")) {
+    if (isTRUE(cov$is_test_failure)) {
+      recovered <- .recover_partial_coverage(pkgdir, install_path, package, version)
+      return(list(status = "test_error", fail_reason = substr(cov$msg, 1, 300),
+                 summary = recovered$summary, file = recovered$file,
+                 func = recovered$func, raw = recovered$raw))
+    }
+    status <- if (grepl("compilation failed|non-zero exit", cov$msg)) "build_fail" else "covr_error"
+    return(list(status = status, fail_reason = substr(cov$msg, 1, 300)))
+  }
+
+  s   <- summarise_coverage(cov)
+  fcv <- cbind(package = package, version = version, file_coverage(cov))
+  fnv <- cbind(package = package, version = version, function_coverage(cov))
+  raw <- serialize(cov, connection = NULL)
+
+  if (.warn_is_test_failure(test_warnings)) {
+    bad <- test_warnings[grepl("test.*fail|fail.*test|FAIL\\s+[1-9]",
+                               test_warnings, ignore.case = TRUE)]
+    return(list(status = "test_error", fail_reason = substr(bad[1], 1, 300),
+               summary = s, file = fcv, func = fnv, raw = raw))
+  }
+
+  list(status = "ok", summary = s, file = fcv, func = fnv, raw = raw,
+      suggests_failed = if (length(failed_soft)) paste(failed_soft, collapse = ",")
+                        else NA_character_)
+}
+
+#' Run covr over an already-extracted package directory. The covr work
+#' happens in a `callr::r()` subprocess (see `.covr_subprocess`) bounded by
+#' `timeout_s`; if it is not back within that budget, callr kills the
+#' subprocess and any children it spawned, and this is recorded as
+#' covr_status = "timeout" instead of hanging the whole shard forever.
+#' Defaults to the pipeline-wide PER_UNIT_TIMEOUT_S but can be overridden,
+#' for example in tests.
 run_unit_dir <- function(package, version, pkgdir, timeout_s = PER_UNIT_TIMEOUT_S) {
   fp <- apply_determinism()
   t0 <- proc.time()[["elapsed"]]
@@ -240,101 +352,63 @@ run_unit_dir <- function(package, version, pkgdir, timeout_s = PER_UNIT_TIMEOUT_
 
   if (!.has_tests(pkgdir)) return(finish("no_tests"))
 
-  failed_soft <- tryCatch(.install_deps(pkgdir), error = function(e) NULL)
-
-  # clean = FALSE and an install_path we control let us recover coverage
-  # traces after a test-failure error (see .recover_partial_coverage above).
-  # We take over the cleanup covr would otherwise have done itself.
-  install_path <- tempfile("covr_lib_")
-  dir.create(install_path, showWarnings = FALSE)
-  on.exit({
-    unlink(install_path, recursive = TRUE, force = TRUE)
-    try(covr:::clean_objects(pkgdir), silent = TRUE)
-    try(covr:::clean_gcov(pkgdir), silent = TRUE)
-    try(covr:::clean_parse_data(), silent = TRUE)
-  }, add = TRUE)
-
-  test_warnings <- character(0)
-  cov <- tryCatch(
-    withCallingHandlers(
-      R.utils::withTimeout(
-        covr::package_coverage(pkgdir, type = "tests", quiet = TRUE,
-                               clean = FALSE, install_path = install_path),
-        timeout = timeout_s, onTimeout = "error"
-      ),
-      warning = function(w) {
-        test_warnings <<- c(test_warnings, conditionMessage(w))
-        invokeRestart("muffleWarning")
-      }
-    ),
-    error = function(e) structure(
-      list(msg = conditionMessage(e), is_test_failure = inherits(e, "covr_error"),
-           is_timeout = inherits(e, "TimeoutException")),
-      class = "cov_err")
+  repo_root <- .PIPELINE_ROOT
+  wr <- tryCatch(
+    callr::r(.covr_subprocess,
+            args = list(mode = "unit", repo_root = repo_root, pkgdir = pkgdir,
+                        package = package, version = version),
+            timeout = timeout_s),
+    error = function(e) e
   )
 
-  if (inherits(cov, "cov_err")) {
-    if (isTRUE(cov$is_timeout)) {
-      return(finish("timeout", tests_passed = FALSE,
-                    extra = list(fail_reason = substr(cov$msg, 1, 300))))
-    }
-    if (isTRUE(cov$is_test_failure)) {
-      recovered <- .recover_partial_coverage(pkgdir, install_path, package, version)
-      extra <- list(fail_reason = substr(cov$msg, 1, 300))
-      if (!is.null(recovered)) {
-        rs <- recovered$summary
-        for (n in names(rs)) extra[[n]] <- rs[[n]]
-        extra$coverage_tests_pct <- rs$line_pct
-      }
-      out <- finish("test_error", tests_passed = FALSE, extra = extra)
-      if (!is.null(recovered)) {
-        out$file <- recovered$file
-        out$func <- recovered$func
-        out$raw  <- recovered$raw
-      }
-      return(out)
-    }
-    status <- if (grepl("compilation failed|non-zero exit", cov$msg)) "build_fail" else "covr_error"
-    return(finish(status, extra = list(fail_reason = substr(cov$msg, 1, 300))))
+  if (inherits(wr, "callr_timeout_error")) {
+    return(finish("timeout", tests_passed = FALSE,
+                  extra = list(fail_reason = sprintf(
+                    "covr subprocess exceeded the %ds timeout and was terminated",
+                    timeout_s))))
+  }
+  if (inherits(wr, "error")) {
+    return(finish("covr_error",
+                  extra = list(fail_reason = substr(conditionMessage(wr), 1, 300))))
   }
 
-  if (.warn_is_test_failure(test_warnings)) {
-    s   <- summarise_coverage(cov)
-    fcv <- file_coverage(cov)
-    fnv <- function_coverage(cov)
-    extra <- as.list(s)
-    extra$coverage_tests_pct <- s$line_pct
-    bad <- test_warnings[grepl("test.*fail|fail.*test|FAIL\\s+[1-9]", test_warnings, ignore.case = TRUE)]
-    extra$fail_reason <- substr(bad[1], 1, 300)
+  if (wr$status %in% c("build_fail", "covr_error")) {
+    return(finish(wr$status, extra = list(fail_reason = wr$fail_reason)))
+  }
+
+  if (identical(wr$status, "test_error")) {
+    extra <- list(fail_reason = wr$fail_reason)
+    if (!is.null(wr$summary)) {
+      for (n in names(wr$summary)) extra[[n]] <- wr$summary[[n]]
+      extra$coverage_tests_pct <- wr$summary$line_pct
+    }
     out <- finish("test_error", tests_passed = FALSE, extra = extra)
-    out$file <- cbind(package = package, version = version, fcv)
-    out$func <- cbind(package = package, version = version, fnv)
-    out$raw  <- serialize(cov, connection = NULL)
+    out$file <- wr$file
+    out$func <- wr$func
+    out$raw  <- wr$raw
     return(out)
   }
 
-  s   <- summarise_coverage(cov)
-  fcv <- file_coverage(cov)
-  fnv <- function_coverage(cov)
-  # by-type: examples and vignettes reinstall the target; keep them separate.
-  # Bounded by the same timeout as the tests run, since these also invoke
-  # package code (rendering vignettes, running examples) that can hang.
+  # status == "ok": tests passed. examples/vignettes are each their own
+  # subprocess call, bounded by the same timeout_s, so a hang in one of
+  # them cannot erase this result (see .covr_subprocess).
   type_pct <- function(tp) tryCatch(
-    round(covr::percent_coverage(
-      R.utils::withTimeout(covr::package_coverage(pkgdir, type = tp, quiet = TRUE),
-                           timeout = timeout_s, onTimeout = "error"),
-      by = "line"), 4),
+    callr::r(.covr_subprocess,
+            args = list(mode = "type_pct", repo_root = repo_root,
+                        pkgdir = pkgdir, type = tp),
+            timeout = timeout_s),
     error = function(e) NA_real_)
-  extra <- as.list(s)
-  extra$coverage_tests_pct     <- s$line_pct
+
+  extra <- as.list(wr$summary)
+  extra$coverage_tests_pct     <- wr$summary$line_pct
   extra$coverage_examples_pct  <- type_pct("examples")
   extra$coverage_vignettes_pct <- type_pct("vignettes")
-  extra$suggests_failed        <- if (length(failed_soft)) paste(failed_soft, collapse = ",") else NA_character_
+  extra$suggests_failed        <- wr$suggests_failed
 
   out <- finish("ok", tests_passed = TRUE, extra = extra)
-  out$file <- cbind(package = package, version = version, fcv)
-  out$func <- cbind(package = package, version = version, fnv)
-  out$raw  <- serialize(cov, connection = NULL)
+  out$file <- wr$file
+  out$func <- wr$func
+  out$raw  <- wr$raw
   out
 }
 

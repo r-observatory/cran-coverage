@@ -31,9 +31,12 @@ make_failing_pkg <- function() {
   d
 }
 
-#' A package whose test never returns in time (it sleeps well past any
-#' reasonable per-unit timeout). Used to check that a hung unit is recorded
-#' as covr_status "timeout" rather than blocking the runner forever.
+#' A package whose test never returns (it sleeps far longer than any
+#' per-unit timeout used in tests, and could not be interrupted by a
+#' cooperative R-evaluator timeout like R.utils::withTimeout, since covr
+#' runs it via system()/system2()). Used to check that a hung unit is
+#' recorded as covr_status "timeout", killed near the timeout deadline,
+#' rather than blocking the runner until the sleep itself finishes.
 make_hanging_pkg <- function() {
   d <- tempfile("covhang_"); dir.create(file.path(d, "R"), recursive = TRUE)
   dir.create(file.path(d, "tests", "testthat"), recursive = TRUE)
@@ -43,7 +46,7 @@ make_hanging_pkg <- function() {
   writeLines("add <- function(a, b) a + b", file.path(d, "R", "f.R"))
   writeLines("library(testthat); library(covhang); test_check(\"covhang\")",
              file.path(d, "tests", "testthat.R"))
-  writeLines(c("test_that(\"hangs\", {", "  Sys.sleep(30)",
+  writeLines(c("test_that(\"hangs\", {", "  Sys.sleep(120)",
                "  expect_equal(add(1, 2), 3)", "})"),
              file.path(d, "tests", "testthat", "test-add.R"))
   d
