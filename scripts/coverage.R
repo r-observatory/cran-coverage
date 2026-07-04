@@ -160,9 +160,16 @@ function_coverage <- function(cov) {
 #' to `install_path` before `show_failures()` is reached, so if
 #' package_coverage() is called with `clean = FALSE` and an install_path we
 #' control, those trace files are still on disk after the error propagates.
-#' `.recover_partial_coverage()` rebuilds a coverage object from them so a
-#' failing test run still yields real coverage numbers instead of NA.
-.recover_partial_coverage <- function(pkgdir, install_path) {
+#' `.recover_partial_coverage()` rebuilds a coverage object from them and
+#' immediately derives every summary (summary row, file table, function
+#' table, raw serialization) from that same object, all inside one tryCatch.
+#' Reconstruction and summarization are kept atomic on purpose: if a future
+#' covr version keeps these internal function names but changes the shape of
+#' the object they return, we want a single NULL result (which the caller
+#' turns into an explicit NA), not a reconstruction that "succeeds" and then
+#' an uncaught error out of summarise_coverage/file_coverage/function_coverage
+#' further down.
+.recover_partial_coverage <- function(pkgdir, install_path, package, version) {
   tryCatch({
     trace_files <- list.files(install_path, pattern = "^covr_trace_",
                               full.names = TRUE, recursive = TRUE)
@@ -170,9 +177,15 @@ function_coverage <- function(cov) {
     merged <- covr:::merge_coverage(trace_files)
     pkg    <- covr:::as_package(pkgdir)
     cov    <- covr:::as_coverage(merged, package = pkg, root = pkgdir)
-    covr:::exclude(cov, line_exclusions = c("src/RcppExports.cpp",
+    cov    <- covr:::exclude(cov, line_exclusions = c("src/RcppExports.cpp",
                     "R/RcppExports.R", "src/cpp11.cpp", "R/cpp11.R"),
                    path = pkgdir)
+    list(
+      summary = summarise_coverage(cov),
+      file    = cbind(package = package, version = version, file_coverage(cov)),
+      func    = cbind(package = package, version = version, function_coverage(cov)),
+      raw     = serialize(cov, connection = NULL)
+    )
   }, error = function(e) NULL)
 }
 
@@ -240,18 +253,18 @@ run_unit_dir <- function(package, version, pkgdir) {
 
   if (inherits(cov, "cov_err")) {
     if (isTRUE(cov$is_test_failure)) {
-      recovered <- .recover_partial_coverage(pkgdir, install_path)
+      recovered <- .recover_partial_coverage(pkgdir, install_path, package, version)
       extra <- list(fail_reason = substr(cov$msg, 1, 300))
       if (!is.null(recovered)) {
-        rs <- summarise_coverage(recovered)
+        rs <- recovered$summary
         for (n in names(rs)) extra[[n]] <- rs[[n]]
         extra$coverage_tests_pct <- rs$line_pct
       }
       out <- finish("test_error", tests_passed = FALSE, extra = extra)
       if (!is.null(recovered)) {
-        out$file <- cbind(package = package, version = version, file_coverage(recovered))
-        out$func <- cbind(package = package, version = version, function_coverage(recovered))
-        out$raw  <- serialize(recovered, connection = NULL)
+        out$file <- recovered$file
+        out$func <- recovered$func
+        out$raw  <- recovered$raw
       }
       return(out)
     }
