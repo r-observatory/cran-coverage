@@ -111,13 +111,33 @@ upsert_coverage <- function(con, summary_df, file_df, func_df) {
   invisible(TRUE)
 }
 
-# --- raw covr object store (append to scripts/export.R) ---
+# Raw covr object store: the serialized covr coverage object for each
+# package/version is kept on disk, partitioned by package first letter, and
+# bundled into per-partition tarballs for release publishing.
 
+#' Partition key for a package's raw covr object: its lowercased first
+#' letter, or "0" for anything that doesn't start with a-z (digits,
+#' punctuation).
+#'
+#' @param package Package name.
+#' @return A single-character partition key.
 raw_partition <- function(package) {
   ch <- tolower(substr(package, 1, 1))
   if (grepl("[a-z]", ch)) ch else "0"
 }
 
+#' Write one package/version's serialized raw covr object to its partition.
+#'
+#' No-ops when raw is NULL (statuses that never produced a coverage object,
+#' for example no_tests or build_fail).
+#'
+#' @param dir     Root directory of the raw object store (partitions are
+#'   created underneath it).
+#' @param package Package name.
+#' @param version Package version.
+#' @param raw     The raw vector to persist (from serialize(cov, NULL)), or
+#'   NULL.
+#' @return invisible(NULL).
 write_raw_object <- function(dir, package, version, raw) {
   if (is.null(raw)) return(invisible(NULL))
   part <- file.path(dir, raw_partition(package))
@@ -126,6 +146,15 @@ write_raw_object <- function(dir, package, version, raw) {
           compress = "xz")
 }
 
+#' Tar each partition directory into its own covr-raw-<partition>.tar.gz,
+#' so the whole store can be published and re-seeded as a set of
+#' per-partition release assets rather than one growing-forever archive.
+#'
+#' @param dir     Root directory of the raw object store (one
+#'   subdirectory per partition, as populated by write_raw_object()).
+#' @param out_dir Directory to write the covr-raw-*.tar.gz files into;
+#'   created if absent.
+#' @return invisible(NULL).
 bundle_partitions <- function(dir, out_dir) {
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
   for (part in list.dirs(dir, recursive = FALSE)) {
