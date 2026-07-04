@@ -42,7 +42,7 @@ jobs:
             mkdir -p out/rawbundles
             gh release download current --pattern 'covr-raw-*.tar.gz' --dir out/rawbundles || true
             for f in out/rawbundles/covr-raw-*.tar.gz; do
-              [ -f "$f" ] && tar xzf "$f"
+              if [ -f "$f" ]; then tar xzf "$f"; fi
             done
           fi
       - name: Run shards until the budget
@@ -61,9 +61,9 @@ jobs:
             Rscript -e 'source("scripts/export.R"); bundle_partitions("out/raw", "out/bundle")'
             GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release upload current out/cran-coverage.db --clobber
             for f in out/bundle/covr-raw-*.tar.gz; do
-              [ -f "$f" ] && GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release upload current "$f" --clobber
+              if [ -f "$f" ]; then GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release upload current "$f" --clobber; fi
             done
             REMAIN=$(jq -r '.remaining' out/manifest.json)
-            [ "$REMAIN" = "0" ] && break
-            [ "$SECONDS" -ge "$BUDGET" ] && break
+            if [ "$REMAIN" = "0" ]; then break; fi
+            if [ "$SECONDS" -ge "$BUDGET" ]; then break; fi
           done
