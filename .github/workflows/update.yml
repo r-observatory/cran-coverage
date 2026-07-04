@@ -1,0 +1,67 @@
+name: Update CRAN Coverage
+on:
+  workflow_dispatch:
+    inputs:
+      time_budget_seconds:
+        description: "Stop starting new shards after this many seconds."
+        default: "18000"
+  schedule:
+    - cron: "0 3 * * *"
+concurrency:
+  group: cran-coverage-update
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    container: rocker/r2u:noble
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: System + R dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends git curl gh jq \
+            r-cran-covr r-cran-testthat r-cran-dbi r-cran-rsqlite r-cran-jsonlite \
+            r-cran-callr pkg-config libcurl4-openssl-dev libssl-dev libxml2-dev
+      - name: Download the prior database
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p out out/raw
+          if gh release view current >/dev/null 2>&1; then
+            gh release download current --pattern cran-coverage.db --dir out || true
+            mkdir -p out/rawbundles
+            gh release download current --pattern 'covr-raw-*.tar.gz' --dir out/rawbundles || true
+            for f in out/rawbundles/covr-raw-*.tar.gz; do
+              [ -f "$f" ] && tar xzf "$f"
+            done
+          fi
+      - name: Run shards until the budget
+        run: |
+          set -uo pipefail
+          BUDGET="${{ inputs.time_budget_seconds || '18000' }}"
+          if ! GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release view current >/dev/null 2>&1; then
+            AUTH=$(printf 'x-access-token:%s' "${{ secrets.GITHUB_TOKEN }}" | base64 | tr -d '\n')
+            git tag -f current
+            git -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${AUTH}" \
+              push -f origin current || true
+            GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release create current \
+              --title "CRAN Coverage (rolling)" \
+              --notes "Latest-version test coverage for CRAN packages." --latest
+          fi
+          while :; do
+            echo "=== shard (elapsed ${SECONDS}s) ==="
+            Rscript scripts/update.R out/
+            Rscript -e 'source("scripts/export.R"); bundle_partitions("out/raw", "out/bundle")'
+            GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release upload current out/cran-coverage.db --clobber
+            for f in out/bundle/covr-raw-*.tar.gz; do
+              [ -f "$f" ] && GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release upload current "$f" --clobber
+            done
+            REMAIN=$(jq -r '.remaining' out/manifest.json)
+            [ "$REMAIN" = "0" ] && break
+            [ "$SECONDS" -ge "$BUDGET" ] && break
+          done

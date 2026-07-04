@@ -1,0 +1,4 @@
+*.db
+*.tar.gz
+out/
+.Rproj.user
