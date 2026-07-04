@@ -110,3 +110,27 @@ upsert_coverage <- function(con, summary_df, file_df, func_df) {
   .del_and_append(con, "coverage_function", .coerce_logicals(func_df))
   invisible(TRUE)
 }
+
+# --- raw covr object store (append to scripts/export.R) ---
+
+raw_partition <- function(package) {
+  ch <- tolower(substr(package, 1, 1))
+  if (grepl("[a-z]", ch)) ch else "0"
+}
+
+write_raw_object <- function(dir, package, version, raw) {
+  if (is.null(raw)) return(invisible(NULL))
+  part <- file.path(dir, raw_partition(package))
+  dir.create(part, showWarnings = FALSE, recursive = TRUE)
+  saveRDS(raw, file.path(part, sprintf("%s_%s.rds", package, version)),
+          compress = "xz")
+}
+
+bundle_partitions <- function(dir, out_dir) {
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  for (part in list.dirs(dir, recursive = FALSE)) {
+    name <- basename(part)
+    tar  <- file.path(out_dir, sprintf("covr-raw-%s.tar.gz", name))
+    utils::tar(tar, files = part, compression = "gzip", tar = "internal")
+  }
+}
