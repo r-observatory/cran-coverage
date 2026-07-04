@@ -17,6 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     container: rocker/r2u:noble
     timeout-minutes: 350
+    env:
+      GH_REPO: ${{ github.repository }}
     defaults:
       run:
         shell: bash
