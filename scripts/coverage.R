@@ -28,3 +28,73 @@ coverage_fingerprint <- function(seed = COVERAGE_SEED) {
     seed   = seed
   )
 }
+
+# --- extractors (append to scripts/coverage.R) ---
+
+.cov_df <- function(cov) {
+  df <- as.data.frame(cov)
+  df$covered <- df$value > 0
+  df$is_compiled <- grepl("^src/", df$filename) |
+    grepl("\\.(c|cc|cpp|cxx|h|hpp|f|f90|f95)$", df$filename, ignore.case = TRUE)
+  df
+}
+
+#' One-row summary. Line and expression percentages, counts, compiled split.
+summarise_coverage <- function(cov) {
+  df <- .cov_df(cov)
+  r  <- df[!df$is_compiled, , drop = FALSE]
+  cc <- df[df$is_compiled, , drop = FALSE]
+  pct <- function(x) if (nrow(x) == 0L) NA_real_ else round(100 * mean(x$covered), 4)
+  data.frame(
+    line_pct              = tryCatch(round(covr::percent_coverage(cov, by = "line"), 4),
+                                     error = function(e) pct(df)),
+    expr_pct              = tryCatch(round(covr::percent_coverage(cov, by = "expression"), 4),
+                                     error = function(e) pct(df)),
+    lines_total           = nrow(r),
+    lines_covered         = sum(r$covered),
+    lines_missed          = sum(!r$covered),
+    zero_coverage_lines   = sum(!r$covered),
+    compiled_line_pct     = pct(cc),
+    compiled_lines_total  = nrow(cc),
+    compiled_lines_covered = sum(cc$covered),
+    stringsAsFactors = FALSE
+  )
+}
+
+#' Per-file coverage.
+file_coverage <- function(cov) {
+  df <- .cov_df(cov)
+  agg <- stats::aggregate(covered ~ filename, df, function(x) c(sum(x), length(x)))
+  data.frame(
+    file          = agg$filename,
+    lines_covered = agg$covered[, 1],
+    lines_total   = agg$covered[, 2],
+    coverage_pct  = round(100 * agg$covered[, 1] / agg$covered[, 2], 4),
+    stringsAsFactors = FALSE
+  )
+}
+
+#' Per-function coverage. Joined on (file, label). covr labels S4 methods by
+#' signature and R6/RC methods by bare name; we keep the label verbatim and
+#' also carry the file so downstream reconciliation with the analyzer is
+#' possible, and we never assume a 1:1 name match.
+function_coverage <- function(cov) {
+  df <- .cov_df(cov)
+  df <- df[!is.na(df$functions) & nzchar(df$functions), , drop = FALSE]
+  if (nrow(df) == 0L) {
+    return(data.frame(file = character(), label = character(),
+                      lines_total = integer(), lines_covered = integer(),
+                      coverage_pct = numeric(), stringsAsFactors = FALSE))
+  }
+  key <- paste(df$filename, df$functions, sep = "\x1f")
+  agg <- stats::aggregate(covered ~ key, df, function(x) c(sum(x), length(x)))
+  parts <- do.call(rbind, strsplit(agg$key, "\x1f", fixed = TRUE))
+  data.frame(
+    file          = parts[, 1],
+    label         = parts[, 2],
+    lines_covered = agg$covered[, 1],
+    lines_total   = agg$covered[, 2],
+    coverage_pct  = round(100 * agg$covered[, 1] / agg$covered[, 2], 4),
+    stringsAsFactors = FALSE
+  )
+}
