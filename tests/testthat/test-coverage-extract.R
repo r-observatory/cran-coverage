@@ -24,6 +24,11 @@ test_that("summary/file/function extraction on a known fixture", {
   s <- summarise_coverage(cov)
   expect_equal(s$line_pct, 50)                 # add covered, untested not
   expect_true(s$lines_total >= 2)
+  expect_equal(s$lines_total, 2)
+  expect_equal(s$lines_covered, 1)
+  expect_equal(s$expr_total, 2)
+  expect_equal(s$expr_covered, 1)
+  expect_true(is.na(s$compiled_line_pct))
 
   fc <- file_coverage(cov)
   expect_true(any(grepl("f\\.R$", fc$file)))

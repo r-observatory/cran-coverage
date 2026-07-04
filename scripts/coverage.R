@@ -31,31 +31,45 @@ coverage_fingerprint <- function(seed = COVERAGE_SEED) {
 
 # --- extractors (append to scripts/coverage.R) ---
 
+.is_compiled_file <- function(filename) {
+  grepl("^src/", filename) |
+    grepl("\\.(c|cc|cpp|cxx|h|hpp|f|f90|f95)$", filename, ignore.case = TRUE)
+}
+
 .cov_df <- function(cov) {
   df <- as.data.frame(cov)
   df$covered <- df$value > 0
-  df$is_compiled <- grepl("^src/", df$filename) |
-    grepl("\\.(c|cc|cpp|cxx|h|hpp|f|f90|f95)$", df$filename, ignore.case = TRUE)
+  df$is_compiled <- .is_compiled_file(df$filename)
   df
 }
 
-#' One-row summary. Line and expression percentages, counts, compiled split.
+#' One-row summary. True line counts (from a per-line tally), true expression
+#' counts (from the traced-expression data frame), line/expression
+#' percentages, and the compiled split.
 summarise_coverage <- function(cov) {
   df <- .cov_df(cov)
   r  <- df[!df$is_compiled, , drop = FALSE]
   cc <- df[df$is_compiled, , drop = FALSE]
   pct <- function(x) if (nrow(x) == 0L) NA_real_ else round(100 * mean(x$covered), 4)
+
+  tl <- covr::tally_coverage(cov, by = "line")
+  tl <- tl[!.is_compiled_file(tl$filename), , drop = FALSE]
+  lines_covered <- sum(tl$value > 0)
+
   data.frame(
-    line_pct              = tryCatch(round(covr::percent_coverage(cov, by = "line"), 4),
-                                     error = function(e) pct(df)),
-    expr_pct              = tryCatch(round(covr::percent_coverage(cov, by = "expression"), 4),
-                                     error = function(e) pct(df)),
-    lines_total           = nrow(r),
-    lines_covered         = sum(r$covered),
-    lines_missed          = sum(!r$covered),
-    zero_coverage_lines   = sum(!r$covered),
-    compiled_line_pct     = pct(cc),
-    compiled_lines_total  = nrow(cc),
+    line_pct               = tryCatch(round(covr::percent_coverage(cov, by = "line"), 4),
+                                      error = function(e) pct(df)),
+    expr_pct               = tryCatch(round(covr::percent_coverage(cov, by = "expression"), 4),
+                                      error = function(e) pct(df)),
+    lines_total            = nrow(tl),
+    lines_covered          = lines_covered,
+    lines_missed           = nrow(tl) - lines_covered,
+    expr_total             = nrow(r),
+    expr_covered           = sum(r$covered),
+    expr_missed            = nrow(r) - sum(r$covered),
+    zero_coverage_lines    = nrow(tl) - lines_covered,
+    compiled_line_pct      = pct(cc),
+    compiled_lines_total   = nrow(cc),
     compiled_lines_covered = sum(cc$covered),
     stringsAsFactors = FALSE
   )
