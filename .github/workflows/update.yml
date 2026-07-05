@@ -55,15 +55,40 @@ jobs:
               --title "CRAN Coverage (rolling)" \
               --notes "Latest-version test coverage for CRAN packages." --latest
           fi
+          # Publish the rolling database and any raw-object tarballs. Called after
+          # every shard, including a failed one, so partial per-package progress is
+          # never lost. Each step is best-effort so publishing never aborts the run.
+          publish() {
+            if [ -f out/cran-coverage.db ]; then
+              GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release upload current out/cran-coverage.db --clobber || true
+            fi
+            Rscript -e 'source("scripts/export.R"); bundle_partitions("out/raw", "out/bundle")' || true
+            for f in out/bundle/covr-raw-*.tar.gz; do
+              if [ -f "$f" ]; then GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release upload current "$f" --clobber || true; fi
+            done
+          }
+          fails=0
           while :; do
             echo "=== shard (elapsed ${SECONDS}s) ==="
-            Rscript scripts/update.R out/
-            Rscript -e 'source("scripts/export.R"); bundle_partitions("out/raw", "out/bundle")'
-            GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release upload current out/cran-coverage.db --clobber
-            for f in out/bundle/covr-raw-*.tar.gz; do
-              if [ -f "$f" ]; then GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release upload current "$f" --clobber; fi
-            done
-            REMAIN=$(jq -r '.remaining' out/manifest.json)
-            if [ "$REMAIN" = "0" ]; then break; fi
+            if Rscript scripts/update.R out/; then
+              fails=0
+              publish
+              REMAIN=$(jq -r '.remaining' out/manifest.json 2>/dev/null || echo 1)
+              if [ "$REMAIN" = "0" ]; then break; fi
+            else
+              # A shard runner can die when installing a package's dependencies via
+              # apt/bspm replaces a loaded shared object (rlang.so and the like) mid
+              # run. That is an intermittent environment hiccup, not a logic error.
+              # Publish the partial progress, then retry once in a fresh process, which
+              # loads the now-consistent library. If it keeps failing, stop this run
+              # cleanly and let the next scheduled run resume from a fresh container.
+              fails=$((fails + 1))
+              echo "shard runner exited non-zero (attempt ${fails}); publishing partial progress and retrying in a fresh process"
+              publish
+              if [ "$fails" -ge 2 ]; then
+                echo "repeated shard failure; stopping this run, banked coverage is safe and the next scheduled run starts fresh"
+                break
+              fi
+            fi
             if [ "$SECONDS" -ge "$BUDGET" ]; then break; fi
           done
