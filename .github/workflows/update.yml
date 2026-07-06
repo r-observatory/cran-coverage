@@ -134,6 +134,6 @@ jobs:
               "Assets: `cran-coverage.db` (SQLite), `covr-raw-*.tar.gz` (raw covr objects), `manifest.json` (latest run status)."
             )
             writeLines(notes, "notes.md")
-          '
+          ' || { echo "collection summary generation failed; leaving release notes unchanged"; exit 0; }
           gh release edit current --notes-file notes.md || true
           if [ -f out/manifest.json ]; then gh release upload current out/manifest.json --clobber || true; fi
