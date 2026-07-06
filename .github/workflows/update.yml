@@ -6,7 +6,10 @@ on:
         description: "Stop starting new shards after this many seconds."
         default: "18000"
   schedule:
-    - cron: "0 3 * * *"
+    # Every 6 hours: keep collecting, and relaunch soon after a run ends or a
+    # job goes down. A run is budget-bounded (~5h) so runs do not overlap; the
+    # collection is resumable, so each run picks up where the last one stopped.
+    - cron: "0 */6 * * *"
 concurrency:
   group: cran-coverage-update
   cancel-in-progress: false
@@ -92,3 +95,45 @@ jobs:
             fi
             if [ "$SECONDS" -ge "$BUDGET" ]; then break; fi
           done
+
+      - name: Publish collection summary
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f out/cran-coverage.db ]; then echo "no database yet; nothing to summarize"; exit 0; fi
+          Rscript --vanilla -e '
+            suppressMessages(library(DBI))
+            con <- dbConnect(RSQLite::SQLite(), "out/cran-coverage.db")
+            cs <- dbGetQuery(con, "SELECT covr_status, line_pct, r_version, covr_version FROM coverage_summary")
+            dbDisconnect(con)
+            total <- nrow(cs)
+            ok <- sum(cs$covr_status == "ok", na.rm = TRUE)
+            notests <- sum(cs$covr_status == "no_tests", na.rm = TRUE)
+            failed <- total - ok - notests
+            meas <- cs$line_pct[!is.na(cs$line_pct)]
+            med <- if (length(meas)) round(stats::median(meas), 1) else NA
+            mn  <- if (length(meas)) round(mean(meas), 1) else NA
+            man <- tryCatch(jsonlite::fromJSON("out/manifest.json"), error = function(e) list(processed = NA, remaining = NA))
+            top <- function(x) { x <- x[!is.na(x)]; if (length(x)) names(sort(table(x), decreasing = TRUE))[1] else "n/a" }
+            f <- function(n) if (is.na(n)) "n/a" else format(n, big.mark = ",")
+            notes <- c(
+              "Rolling database of CRAN latest-version test coverage, computed with covr under one consistent recipe.",
+              "",
+              sprintf("**%s packages** processed so far:", f(total)),
+              sprintf("- **%s** with measured coverage", f(ok)),
+              sprintf("- **%s** ship no test suite (nothing for covr to measure)", f(notests)),
+              sprintf("- **%s** failed to build or test", f(failed)),
+              "",
+              sprintf("Line coverage of measured packages: median **%s%%**, mean **%s%%**.", med, mn),
+              "",
+              sprintf("Most recent run processed **%s** package(s); **%s** still to collect.", f(man$processed), f(man$remaining)),
+              "",
+              sprintf("R %s | covr %s | updated %s UTC.", top(cs$r_version), top(cs$covr_version), format(Sys.time(), "%Y-%m-%d %H:%M", tz = "UTC")),
+              "",
+              "Assets: `cran-coverage.db` (SQLite), `covr-raw-*.tar.gz` (raw covr objects), `manifest.json` (latest run status)."
+            )
+            writeLines(notes, "notes.md")
+          '
+          gh release edit current --notes-file notes.md || true
+          if [ -f out/manifest.json ]; then gh release upload current out/manifest.json --clobber || true; fi
