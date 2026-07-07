@@ -31,11 +31,11 @@ test_that("install_sysreqs reads the target DESCRIPTION and is best-effort", {
     d
   }
   # No SystemRequirements -> nothing attempted.
-  expect_identical(install_sysreqs(mkpkg("")), character(0))
+  expect_identical(suppressMessages(install_sysreqs(mkpkg(""))), character(0))
 
   skip_if_not_installed("pkgdepends")
   # Declares a requirement -> returns the apt packages it attempted (the
   # actual apt-get is best-effort and simply no-ops where apt is unavailable).
-  attempted <- install_sysreqs(mkpkg("GNU GSL"))
+  attempted <- suppressMessages(install_sysreqs(mkpkg("GNU GSL")))
   expect_true(is.character(attempted) && length(attempted) >= 1L)
 })
