@@ -114,9 +114,13 @@ select_shard <- function(universe, state, size, rank = character(0),
   if (!any(todo)) return(character(0))
 
   pkg  <- pkg[todo]
-  akey <- ifelse(never[todo] | newver[todo], 0L, a_att[todo])   # fresh work first
+  akey <- ifelse(never[todo] | newver[todo], 0L, a_att[todo])
   rk   <- match(pkg, rank); rk[is.na(rk)] <- .Machine$integer.max
-  utils::head(pkg[order(akey, rk, pkg)], size)
+  # Order by popularity rank first, so a popular retryable failure is tried at
+  # its rank alongside new work (a fix such as sysreqs reaches it soon) rather
+  # than waiting behind the whole never-attempted backlog. attempts breaks ties
+  # within a rank (unranked packages: never-attempted before re-attempts).
+  utils::head(pkg[order(rk, akey, pkg)], size)
 }
 
 run_shard <- function(io, out_dir, shard_size = SHARD_SIZE,

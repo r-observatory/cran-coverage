@@ -189,6 +189,29 @@ function_coverage <- function(cov) {
         msg, ignore.case = TRUE)
 }
 
+#' On a build failure, run a plain R CMD INSTALL of the target to capture the
+#' actual compiler/parser/dependency error, so the recorded reason is
+#' actionable instead of covr's generic "Package installation did not
+#' succeed." The target's dependencies were already installed by covr before
+#' it failed. Bounded by `timeout` where available; best-effort, returning ""
+#' on any problem so it can never turn a clean failure into an error.
+.capture_install_error <- function(pkgdir, timeout_s = 300L) {
+  lib <- tempfile("diaglib_"); dir.create(lib, showWarnings = FALSE)
+  on.exit(unlink(lib, recursive = TRUE, force = TRUE), add = TRUE)
+  args <- c("CMD", "INSTALL", "--no-test-load", "-l", lib, pkgdir)
+  out <- tryCatch(suppressWarnings(
+    if (nzchar(Sys.which("timeout")))
+      system2("timeout", c(as.character(timeout_s), "R", args),
+              stdout = TRUE, stderr = TRUE)
+    else
+      system2("R", args, stdout = TRUE, stderr = TRUE)),
+    error = function(e) conditionMessage(e))
+  if (!length(out)) return("")
+  hits <- grep("error|cannot|not found|unable|fatal|undefined|no package|unexpected|failed",
+               out, ignore.case = TRUE, value = TRUE)
+  paste(utils::tail(if (length(hits)) hits else out, 3L), collapse = " | ")
+}
+
 # System requirements: covr recompiles the TARGET from source under
 # instrumentation, so it needs the target's build-time system libraries
 # (-dev headers). Dependencies stay as r2u binaries and already pull their
@@ -399,8 +422,12 @@ install_sysreqs <- function(pkgdir) {
                  summary = recovered$summary, file = recovered$file,
                  func = recovered$func, raw = recovered$raw))
     }
-    status <- if (.is_build_failure(cov$msg)) "build_fail" else "covr_error"
-    return(list(status = status, fail_reason = substr(cov$msg, 1, 300)))
+    if (.is_build_failure(cov$msg)) {
+      detail <- tryCatch(.capture_install_error(pkgdir), error = function(e) "")
+      reason <- if (nzchar(detail)) paste0(cov$msg, " ", detail) else cov$msg
+      return(list(status = "build_fail", fail_reason = substr(reason, 1, 300)))
+    }
+    return(list(status = "covr_error", fail_reason = substr(cov$msg, 1, 300)))
   }
 
   s   <- summarise_coverage(cov)
