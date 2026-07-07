@@ -30,11 +30,19 @@ jobs:
           # not fail the job (the sysreqs tests skip when it is absent).
           apt-get install -y --no-install-recommends r-cran-pkgdepends \
             || echo "r-cran-pkgdepends unavailable; sysreqs tests will skip"
-          apt-get install -y --reinstall r-cran-rlang || true
-          # If the rolling rlang binary is built against a different R ABI
-          # (undefined symbol SETLENGTH), rebuild it from source against this R.
-          Rscript -e 'loadNamespace("rlang")' >/dev/null 2>&1 \
-            || Rscript -e 'install.packages("rlang", repos = "https://cloud.r-project.org", type = "source")' \
-            || true
+          # Rebuild any compiled package the rolling image built against a
+          # different R ABI (undefined symbol SETLENGTH) from source against this R.
+          Rscript -e '
+            compiled <- Filter(function(p) {
+              d <- system.file("libs", package = p)
+              nzchar(d) && length(list.files(d, pattern = "[.]so$")) > 0L
+            }, rownames(installed.packages()))
+            broken <- Filter(function(p) !isTRUE(tryCatch({loadNamespace(p); TRUE},
+                             error = function(e) FALSE)), compiled)
+            if (length(broken)) {
+              message("rebuilding ABI-mismatched packages from source: ", paste(broken, collapse = " "))
+              install.packages(broken, repos = "https://cloud.r-project.org", type = "source")
+            } else message("compiled stack OK")
+          ' || true
       - name: Run unit tests
         run: Rscript tests/testthat.R

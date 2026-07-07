@@ -99,14 +99,23 @@ jobs:
           # without it, sysreqs resolution falls back to the Posit PPM API.
           apt-get install -y --no-install-recommends r-cran-pkgdepends \
             || echo "r-cran-pkgdepends unavailable (r2u transient?); sysreqs resolution will use the HTTP fallback"
-          # Force-reinstall rlang so a stale image copy cannot fail to resolve
-          # SETLENGTH. The rolling binary can still be built against a different
-          # R ABI, so verify it loads and, if not, rebuild it from source against
-          # the running R (ABI-correct by construction; independent of r2u).
-          apt-get install -y --reinstall r-cran-rlang || true
-          Rscript -e 'loadNamespace("rlang")' >/dev/null 2>&1 \
-            || Rscript -e 'install.packages("rlang", repos = "https://cloud.r-project.org", type = "source")' \
-            || echo "rlang unavailable; the shard loop will stop cleanly and retry next run"
+          # The rolling image can ship compiled packages built against a
+          # different R ABI than the running R (undefined symbol SETLENGTH),
+          # breaking package load at startup (rlang, bit, ...). Rebuild any such
+          # package in the pipeline's dependency tree from source against this R
+          # (ABI-correct by construction; independent of r2u's binary lag).
+          Rscript -e '
+            compiled <- Filter(function(p) {
+              d <- system.file("libs", package = p)
+              nzchar(d) && length(list.files(d, pattern = "[.]so$")) > 0L
+            }, rownames(installed.packages()))
+            broken <- Filter(function(p) !isTRUE(tryCatch({loadNamespace(p); TRUE},
+                             error = function(e) FALSE)), compiled)
+            if (length(broken)) {
+              message("rebuilding ABI-mismatched packages from source: ", paste(broken, collapse = " "))
+              install.packages(broken, repos = "https://cloud.r-project.org", type = "source")
+            } else message("compiled stack OK")
+          ' || true
       - name: Download this runner's prior state
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -241,12 +250,21 @@ jobs:
           apt-get -y dist-upgrade || true
           apt-get install -y --no-install-recommends gh jq \
             r-cran-dbi r-cran-rsqlite r-cran-jsonlite
-          # DBI/RSQLite load rlang; guard against the rolling ABI break by
-          # rebuilding rlang from source if the binary fails to load.
-          apt-get install -y --reinstall r-cran-rlang || true
-          Rscript -e 'loadNamespace("rlang")' >/dev/null 2>&1 \
-            || Rscript -e 'install.packages("rlang", repos = "https://cloud.r-project.org", type = "source")' \
-            || true
+          # DBI/RSQLite load compiled packages (rlang, bit, ...) that the rolling
+          # image may have built against a different R ABI; rebuild any that fail
+          # to load from source against the running R.
+          Rscript -e '
+            compiled <- Filter(function(p) {
+              d <- system.file("libs", package = p)
+              nzchar(d) && length(list.files(d, pattern = "[.]so$")) > 0L
+            }, rownames(installed.packages()))
+            broken <- Filter(function(p) !isTRUE(tryCatch({loadNamespace(p); TRUE},
+                             error = function(e) FALSE)), compiled)
+            if (length(broken)) {
+              message("rebuilding ABI-mismatched packages from source: ", paste(broken, collapse = " "))
+              install.packages(broken, repos = "https://cloud.r-project.org", type = "source")
+            } else message("compiled stack OK")
+          ' || true
       - name: Merge shard databases and publish the canonical database
         run: |
           set -uo pipefail
