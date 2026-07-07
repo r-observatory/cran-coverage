@@ -131,9 +131,17 @@ run_shard <- function(io, out_dir, shard_size = SHARD_SIZE,
   prior_att <- stats::setNames(state$attempts, state$package)
   shard     <- select_shard(universe, state, shard_size, rank = rank, slice = slice)
 
+  n <- length(shard)
+  lbl <- if (is.null(slice)) "" else sprintf("partition %d/%d ", slice$index, slice$count)
+  message(sprintf("%s%d package(s) this shard: %s%s", lbl, n,
+                  paste(utils::head(shard, 6), collapse = ", "),
+                  if (n > 6L) ", ..." else ""))
+
   processed <- 0L
   for (pkg in shard) {
     v <- universe$latest_version[universe$package == pkg][1]
+    message(sprintf("[%d/%d] %s %s ...", processed + 1L, n, pkg, v))
+    t0 <- proc.time()[["elapsed"]]
     wd <- tempfile(paste0("cov_", pkg, "_")); dir.create(wd)
     res <- tryCatch(io$run(pkg, v, wd),
       error = function(e) list(summary = data.frame(package = pkg, version = v,
@@ -145,12 +153,19 @@ run_shard <- function(io, out_dir, shard_size = SHARD_SIZE,
     upsert_coverage(con, res$summary, res$file, res$func)
     if (!is.null(res$raw)) write_raw_object(raw_dir, pkg, v, res$raw)
     unlink(wd, recursive = TRUE, force = TRUE)
+    st  <- res$summary$covr_status[1]
+    lp  <- suppressWarnings(as.numeric(res$summary[["line_pct"]][1]))
+    pct <- if (length(lp) == 1L && !is.na(lp)) sprintf(" %.1f%%", lp) else ""
+    message(sprintf("    -> %s%s (%.0fs)", st, pct, proc.time()[["elapsed"]] - t0))
     processed <- processed + 1L
   }
-  manifest <- list(processed = processed, shard_size = length(shard),
+  manifest <- list(processed = processed, shard_size = n,
                    remaining = max(0L, length(select_shard(universe,
                      analyzed_state(con), .Machine$integer.max,
                      rank = rank, slice = slice))))
+  message(sprintf("shard complete: %d processed, %d remaining%s", processed,
+                  manifest$remaining,
+                  if (is.null(slice)) "" else sprintf(" in partition %d", slice$index)))
   writeLines(jsonlite::toJSON(manifest, auto_unbox = TRUE),
              file.path(out_dir, "manifest.json"))
   manifest
