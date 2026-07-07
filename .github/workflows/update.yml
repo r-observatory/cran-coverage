@@ -142,7 +142,12 @@ jobs:
             if [ -f out/cran-coverage.db ]; then
               NEW_ROWS=$(Rscript -e 'source("scripts/export.R"); cat(summary_row_count("out/cran-coverage.db"))' 2>/dev/null || echo 0)
               if [ "$NEW_ROWS" -gt 0 ] && [ "$NEW_ROWS" -ge "$PRIOR_ROWS" ]; then
-                gh release upload current "out/cran-coverage.db#${SHARD_ASSET}" --clobber || true
+                # Upload under the shard's own asset name. `gh` treats file#name
+                # as a display LABEL, not the asset filename, so a copy named for
+                # the asset is the only way to avoid every runner clobbering the
+                # canonical cran-coverage.db.
+                cp -f out/cran-coverage.db "out/${SHARD_ASSET}"
+                gh release upload current "out/${SHARD_ASSET}" --clobber || true
               else
                 echo "refusing to publish shard DB: new rows ($NEW_ROWS) < prior rows ($PRIOR_ROWS); keeping the released shard"
               fi
@@ -229,7 +234,10 @@ jobs:
             echo "refusing to publish merged DB (${MERGED} rows) over the prior canonical (${PRIOR} rows)"
             exit 0
           fi
-          gh release upload current "out-cran-coverage.db#cran-coverage.db" --clobber || true
+          # Publish under the exact asset name consumers read. gh's file#name is
+          # a display label, not a rename, so copy to the target filename first.
+          cp -f out-cran-coverage.db cran-coverage.db
+          gh release upload current cran-coverage.db --clobber || true
       - name: Publish collection summary
         if: always()
         run: |
