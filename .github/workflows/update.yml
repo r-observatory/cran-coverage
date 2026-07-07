@@ -11,17 +11,53 @@ on:
     # collection is resumable, so each run picks up where the last one stopped.
     - cron: "0 */6 * * *"
 concurrency:
+  # Serialize whole workflow runs (all matrix legs + merge) across scheduled
+  # ticks so two runs never write the release at once.
   group: cran-coverage-update
   cancel-in-progress: false
 permissions:
   contents: write
+env:
+  # Matrix width for parallel collection. Start narrow; widening later is safe
+  # (runners with no shard asset self-seed their slice from the canonical DB).
+  # Keep this in sync with the collect job's matrix.index list.
+  SHARD_COUNT: "4"
 jobs:
-  update:
+  # Make sure the rolling release exists before the matrix fans out, so eight
+  # runners do not race to create it.
+  bootstrap:
     runs-on: ubuntu-latest
-    container: rocker/r2u:noble
-    timeout-minutes: 350
     env:
       GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Ensure the rolling release exists
+        run: |
+          set -euo pipefail
+          if ! gh release view current >/dev/null 2>&1; then
+            gh release create current \
+              --target "$GITHUB_SHA" \
+              --title "CRAN Coverage (rolling)" \
+              --notes "Latest-version test coverage for CRAN packages." --latest
+          fi
+
+  collect:
+    needs: bootstrap
+    runs-on: ubuntu-latest
+    container:
+      image: rocker/r2u:noble
+      # Coarse container memory cap: a runaway untrusted test suite is killed
+      # rather than taking down the runner. Per-unit hangs are bounded
+      # separately by the covr subprocess timeout (PER_UNIT_TIMEOUT_S).
+      options: --memory=14g
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [0, 1, 2, 3]
+    env:
+      GH_REPO: ${{ github.repository }}
+      SHARD_INDEX: ${{ matrix.index }}
     defaults:
       run:
         shell: bash
@@ -35,44 +71,80 @@ jobs:
           apt-get install -y --no-install-recommends git curl gh jq \
             r-cran-covr r-cran-testthat r-cran-dbi r-cran-rsqlite r-cran-jsonlite \
             r-cran-callr pkg-config libcurl4-openssl-dev libssl-dev libxml2-dev
-      - name: Download the prior database
+      - name: Download this runner's prior shard database
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           mkdir -p out out/raw
-          if gh release view current >/dev/null 2>&1; then
-            gh release download current --pattern cran-coverage.db --dir out || true
-            mkdir -p out/rawbundles
-            gh release download current --pattern 'covr-raw-*.tar.gz' --dir out/rawbundles || true
-            for f in out/rawbundles/covr-raw-*.tar.gz; do
-              if [ -f "$f" ]; then tar xzf "$f"; fi
-            done
+          SHARD_ASSET="cran-coverage-shard-${SHARD_INDEX}.db"
+          PRIOR_ROWS=0
+          # Read the asset list into a variable first: with -e, a transient
+          # `gh release view` failure aborts the step (the run just retries next
+          # tick) instead of being misread as "no prior shard" and restarting
+          # this partition from scratch.
+          ASSETS=$(gh release view current --json assets -q '.assets[].name')
+          # If this runner's shard DB is already published, the download MUST
+          # succeed: proceeding from an empty DB would clobber banked coverage.
+          if echo "$ASSETS" | grep -qx "$SHARD_ASSET"; then
+            gh release download current --pattern "$SHARD_ASSET" --dir out
+            mv "out/$SHARD_ASSET" out/cran-coverage.db
+            PRIOR_ROWS=$(Rscript -e 'source("scripts/export.R"); cat(summary_row_count("out/cran-coverage.db"))')
+            if [ "$PRIOR_ROWS" -eq 0 ]; then
+              echo "prior shard DB present on the release but downloaded empty/corrupt; aborting to avoid clobbering it"
+              exit 1
+            fi
+          elif echo "$ASSETS" | grep -qx cran-coverage.db; then
+            # Cutover / self-heal: no per-runner shard yet, but the canonical DB
+            # exists. Seed this runner from just its partition of the canonical
+            # so it resumes instead of recomputing coverage we already have.
+            gh release download current --pattern cran-coverage.db --dir canon
+            PRIOR_ROWS=$(Rscript -e '
+              for (s in c("config.R","export.R","update.R")) source(file.path("scripts", s))
+              cat(subset_partition("canon/cran-coverage.db", "out/cran-coverage.db",
+                                   as.integer(Sys.getenv("SHARD_INDEX")),
+                                   as.integer(Sys.getenv("SHARD_COUNT"))))')
+            echo "seeded shard ${SHARD_INDEX} from the canonical DB: ${PRIOR_ROWS} rows"
           fi
+          echo "$PRIOR_ROWS" > out/.prior_rows
+          # Raw covr objects for this runner (best-effort; never destructive to the DB).
+          mkdir -p out/rawbundles
+          gh release download current --pattern "covr-raw-s${SHARD_INDEX}-*.tar.gz" --dir out/rawbundles 2>/dev/null || true
+          for f in out/rawbundles/covr-raw-s"${SHARD_INDEX}"-*.tar.gz; do
+            if [ -f "$f" ]; then tar xzf "$f" || true; fi
+          done
       - name: Run shards until the budget
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
           BUDGET="${{ inputs.time_budget_seconds || '18000' }}"
-          if ! GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release view current >/dev/null 2>&1; then
-            GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release create current \
-              --target "$GITHUB_SHA" \
-              --title "CRAN Coverage (rolling)" \
-              --notes "Latest-version test coverage for CRAN packages." --latest
-          fi
-          # Publish the rolling database and any raw-object tarballs. Called after
-          # every shard, including a failed one, so partial per-package progress is
-          # never lost. Each step is best-effort so publishing never aborts the run.
+          SHARD_ASSET="cran-coverage-shard-${SHARD_INDEX}.db"
+          PRIOR_ROWS=$(cat out/.prior_rows 2>/dev/null || echo 0)
+          # Publish this runner's shard DB and raw tarballs. Called after every
+          # shard, including a failed one, so partial per-package progress is
+          # never lost. Only this runner ever writes cran-coverage-shard-<i>.db,
+          # so there is no cross-runner clobber; the merge job folds them into
+          # the canonical cran-coverage.db. The row-count guard refuses to
+          # publish a DB smaller than the one we started from, so a corrupted or
+          # truncated local DB can never overwrite banked coverage.
           publish() {
             if [ -f out/cran-coverage.db ]; then
-              GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release upload current out/cran-coverage.db --clobber || true
+              NEW_ROWS=$(Rscript -e 'source("scripts/export.R"); cat(summary_row_count("out/cran-coverage.db"))' 2>/dev/null || echo 0)
+              if [ "$NEW_ROWS" -gt 0 ] && [ "$NEW_ROWS" -ge "$PRIOR_ROWS" ]; then
+                gh release upload current "out/cran-coverage.db#${SHARD_ASSET}" --clobber || true
+              else
+                echo "refusing to publish shard DB: new rows ($NEW_ROWS) < prior rows ($PRIOR_ROWS); keeping the released shard"
+              fi
             fi
-            Rscript -e 'source("scripts/export.R"); bundle_partitions("out/raw", "out/bundle")' || true
-            for f in out/bundle/covr-raw-*.tar.gz; do
-              if [ -f "$f" ]; then GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release upload current "$f" --clobber || true; fi
+            Rscript -e 'source("scripts/export.R"); bundle_partitions("out/raw", "out/bundle", prefix = paste0("covr-raw-s", Sys.getenv("SHARD_INDEX"), "-"))' || true
+            for f in out/bundle/covr-raw-s"${SHARD_INDEX}"-*.tar.gz; do
+              if [ -f "$f" ]; then gh release upload current "$f" --clobber || true; fi
             done
           }
           fails=0
           while :; do
-            echo "=== shard (elapsed ${SECONDS}s) ==="
+            echo "=== shard ${SHARD_INDEX} (elapsed ${SECONDS}s) ==="
             if Rscript scripts/update.R out/; then
               fails=0
               publish
@@ -96,17 +168,75 @@ jobs:
             if [ "$SECONDS" -ge "$BUDGET" ]; then break; fi
           done
 
+  # Fold the per-runner shard databases into the canonical cran-coverage.db
+  # that consumers read, and refresh the honest collection summary. Runs even
+  # if some matrix legs failed, so whatever was collected is still merged.
+  merge:
+    needs: collect
+    if: always()
+    runs-on: ubuntu-latest
+    container: rocker/r2u:noble
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Merge dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends gh jq \
+            r-cran-dbi r-cran-rsqlite r-cran-jsonlite
+      - name: Merge shard databases and publish the canonical database
+        run: |
+          set -uo pipefail
+          mkdir -p shards
+          gh release download current --pattern 'cran-coverage-shard-*.db' --dir shards || true
+          shopt -s nullglob
+          files=(shards/cran-coverage-shard-*.db)
+          if [ ${#files[@]} -eq 0 ]; then echo "no shard databases to merge yet"; exit 0; fi
+          # Prior canonical row count, so we never publish a smaller merged DB.
+          PRIOR=0
+          if gh release view current --json assets -q '.assets[].name' | grep -qx cran-coverage.db; then
+            gh release download current --pattern cran-coverage.db --dir prior || true
+            PRIOR=$(Rscript -e 'source("scripts/export.R"); cat(summary_row_count("prior/cran-coverage.db"))' 2>/dev/null || echo 0)
+          fi
+          MERGED=$(Rscript -e '
+            source("scripts/export.R")
+            shards <- list.files("shards", pattern = "^cran-coverage-shard-.*\\.db$", full.names = TRUE)
+            n <- merge_shards(shards, "out-cran-coverage.db")
+            cat(n)
+          ')
+          echo "merged rows: ${MERGED} (prior canonical: ${PRIOR})"
+          if [ -z "$MERGED" ] || [ "$MERGED" -le 0 ] || [ "$MERGED" -lt "$PRIOR" ]; then
+            echo "refusing to publish merged DB (${MERGED} rows) over the prior canonical (${PRIOR} rows)"
+            exit 0
+          fi
+          gh release upload current "out-cran-coverage.db#cran-coverage.db" --clobber || true
       - name: Publish collection summary
         if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ ! -f out/cran-coverage.db ]; then echo "no database yet; nothing to summarize"; exit 0; fi
-          Rscript --vanilla -e '
-            suppressMessages(library(DBI))
-            con <- dbConnect(RSQLite::SQLite(), "out/cran-coverage.db")
-            cs <- dbGetQuery(con, "SELECT covr_status, line_pct, r_version, covr_version FROM coverage_summary")
-            dbDisconnect(con)
+          set -uo pipefail
+          if [ ! -f out-cran-coverage.db ]; then echo "no merged database; nothing to summarize"; exit 0; fi
+          Rscript -e '
+            for (s in c("config.R","sources.R","coverage.R","export.R","update.R")) source(file.path("scripts", s))
+            suppressWarnings(suppressMessages({
+              con <- open_db("out-cran-coverage.db")
+              cs  <- DBI::dbGetQuery(con, "SELECT covr_status, line_pct, r_version, covr_version FROM coverage_summary")
+              universe <- tryCatch({
+                db <- available.packages(repos = "https://cloud.r-project.org")
+                data.frame(package = rownames(db), latest_version = as.character(db[, "Version"]),
+                           stringsAsFactors = FALSE)
+              }, error = function(e) NULL)
+              rank  <- popularity_rank("data/popularity.txt")
+              remaining <- if (is.null(universe)) NA_integer_ else
+                length(select_shard(universe, analyzed_state(con), .Machine$integer.max, rank = rank))
+              DBI::dbDisconnect(con)
+            }))
             total <- nrow(cs)
             ok <- sum(cs$covr_status == "ok", na.rm = TRUE)
             notests <- sum(cs$covr_status == "no_tests", na.rm = TRUE)
@@ -114,7 +244,6 @@ jobs:
             meas <- cs$line_pct[!is.na(cs$line_pct)]
             med <- if (length(meas)) round(stats::median(meas), 1) else NA
             mn  <- if (length(meas)) round(mean(meas), 1) else NA
-            man <- tryCatch(jsonlite::fromJSON("out/manifest.json"), error = function(e) list(processed = NA, remaining = NA))
             top <- function(x) { x <- x[!is.na(x)]; if (length(x)) names(sort(table(x), decreasing = TRUE))[1] else "n/a" }
             f <- function(n) if (is.na(n)) "n/a" else format(n, big.mark = ",")
             notes <- c(
@@ -127,13 +256,15 @@ jobs:
               "",
               sprintf("Line coverage of measured packages: median **%s%%**, mean **%s%%**.", med, mn),
               "",
-              sprintf("Most recent run processed **%s** package(s); **%s** still to collect.", f(man$processed), f(man$remaining)),
+              sprintf("**%s** package(s) still to collect (high-download packages first).", f(remaining)),
               "",
               sprintf("R %s | covr %s | updated %s UTC.", top(cs$r_version), top(cs$covr_version), format(Sys.time(), "%Y-%m-%d %H:%M", tz = "UTC")),
               "",
-              "Assets: `cran-coverage.db` (SQLite), `covr-raw-*.tar.gz` (raw covr objects), `manifest.json` (latest run status)."
+              "Assets: `cran-coverage.db` (merged SQLite), `cran-coverage-shard-*.db` (per-runner shards), `covr-raw-*.tar.gz` (raw covr objects)."
             )
             writeLines(notes, "notes.md")
+            man <- list(processed = total, remaining = if (is.na(remaining)) NA else remaining)
+            writeLines(jsonlite::toJSON(man, auto_unbox = TRUE), "manifest.json")
           ' || { echo "collection summary generation failed; leaving release notes unchanged"; exit 0; }
           gh release edit current --notes-file notes.md || true
-          if [ -f out/manifest.json ]; then gh release upload current out/manifest.json --clobber || true; fi
+          if [ -f manifest.json ]; then gh release upload current manifest.json --clobber || true; fi
