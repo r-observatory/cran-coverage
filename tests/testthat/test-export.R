@@ -86,6 +86,34 @@ test_that("merge_shards unions per-shard databases into one", {
   expect_equal(fcount, 4L)
 })
 
+test_that("merge_shards upserts onto an existing database (monotonic merge)", {
+  base <- tempfile(fileext = ".db"); on.exit(unlink(base), add = TRUE)
+  con <- open_db(base)
+  upsert_coverage(con, data.frame(package = c("stuck", "keep"), version = "1",
+                                  covr_status = c("build_fail", "ok"),
+                                  line_pct = c(NA, 60), stringsAsFactors = FALSE),
+                  NULL, NULL)
+  DBI::dbDisconnect(con)
+  # a shard that recovers 'stuck' and adds 'new', but does not carry 'keep'
+  shard <- tempfile(fileext = ".db"); on.exit(unlink(shard), add = TRUE)
+  con <- open_db(shard)
+  upsert_coverage(con, data.frame(package = c("stuck", "new"), version = "1",
+                                  covr_status = "ok", line_pct = c(90, 70),
+                                  stringsAsFactors = FALSE), NULL, NULL)
+  DBI::dbDisconnect(con)
+  # merge the shard ONTO a copy of the base: recoveries apply, nothing drops
+  out <- tempfile(fileext = ".db"); on.exit(unlink(out), add = TRUE)
+  file.copy(base, out)
+  n <- merge_shards(shard, out)
+  con <- open_db(out); on.exit(DBI::dbDisconnect(con), add = TRUE)
+  got <- DBI::dbGetQuery(con, "SELECT package, covr_status FROM coverage_summary")
+  st  <- stats::setNames(got$covr_status, got$package)
+  expect_equal(unname(st[["stuck"]]), "ok")   # recovered (row updated)
+  expect_equal(unname(st[["keep"]]),  "ok")   # preserved (shard lacked it)
+  expect_true("new" %in% got$package)         # added
+  expect_equal(n, 3L)                         # never drops rows below the base
+})
+
 test_that("bundle_partitions honours a custom asset-name prefix", {
   root <- tempfile("raw_"); dir.create(file.path(root, "a"), recursive = TRUE)
   saveRDS(1L, file.path(root, "a", "aaa_1.rds"))
