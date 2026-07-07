@@ -25,8 +25,8 @@ jobs:
           # rlang so its binary matches the running R.
           apt-get -y dist-upgrade
           apt-get install -y --no-install-recommends r-cran-covr r-cran-testthat \
-            r-cran-dbi r-cran-rsqlite r-cran-jsonlite r-cran-callr pkg-config \
-            libcurl4-openssl-dev libssl-dev
+            r-cran-dbi r-cran-rsqlite r-cran-jsonlite r-cran-callr r-cran-pkgdepends \
+            pkg-config libcurl4-openssl-dev libssl-dev
           apt-get install -y --reinstall r-cran-rlang
       - name: Run unit tests
         run: Rscript tests/testthat.R

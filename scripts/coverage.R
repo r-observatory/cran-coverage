@@ -136,6 +136,21 @@ function_coverage <- function(cov) {
   )
 }
 
+#' Prepend package/version identifier columns to a per-file or per-function
+#' coverage table, staying correct when the table has zero rows.
+#'
+#' `cbind(package = , version = , df)` dispatches to `cbind.data.frame`, whose
+#' body is `data.frame(..., check.names = FALSE)`; mixing a length-1 scalar
+#' with a 0-row frame raises "arguments imply differing number of rows: 1, 0".
+#' An empty coverage object (a package whose tests all skip, so covr traced no
+#' lines -- e.g. httr when httpbin is unreachable) makes file_coverage() and
+#' function_coverage() return 0 rows, which crashed the old cbind.
+.tag_pv <- function(df, package, version) {
+  data.frame(package = rep(package, nrow(df)),
+             version = rep(version, nrow(df)),
+             df, stringsAsFactors = FALSE, check.names = FALSE)
+}
+
 # Per-package unit runner: install, run covr, classify the outcome.
 
 .has_tests <- function(pkgdir) {
@@ -163,6 +178,83 @@ function_coverage <- function(cov) {
     if (!s %in% rownames(installed.packages())) failed_soft <- c(failed_soft, s)
   }
   failed_soft
+}
+
+#' Whether a covr error message is a build/install failure (persistent, the
+#' target would not compile/install) rather than a covr-internal error. covr's
+#' install failure raises the literal "Package installation did not succeed.",
+#' which is bucketed as build_fail so the honest breakdown is accurate.
+.is_build_failure <- function(msg) {
+  grepl("compilation failed|non-zero exit|installation did not succeed",
+        msg, ignore.case = TRUE)
+}
+
+# System requirements: covr recompiles the TARGET from source under
+# instrumentation, so it needs the target's build-time system libraries
+# (-dev headers). Dependencies stay as r2u binaries and already pull their
+# runtime libs, so only the target's own SystemRequirements must be resolved.
+
+# Session cache of apt packages already installed this run, so a system library
+# a prior package pulled in is not re-shelled through apt-get.
+.SYSREQS_DONE <- new.env(parent = emptyenv())
+
+#' Resolve a package's SystemRequirements text to Ubuntu apt package names.
+#'
+#' Uses pkgdepends' bundled, offline system-requirements database (the same
+#' mapping pak uses). Falls back to the live Posit PPM sysreqs API ONLY when
+#' the package actually declares SystemRequirements the offline DB did not
+#' match, so the ~half of CRAN that declares none never touches the network.
+#' Returns character(0) for empty/unresolvable input.
+.resolve_sysreqs_apt <- function(sysreqs_text, pkgname = NULL,
+                                 platform = SYSREQS_PLATFORM) {
+  has_text <- !is.null(sysreqs_text) && !is.na(sysreqs_text) &&
+              nzchar(trimws(sysreqs_text))
+  apt <- character(0)
+  if (has_text && requireNamespace("pkgdepends", quietly = TRUE)) {
+    m <- tryCatch(
+      pkgdepends::sysreqs_db_match(sysreqs_text, sysreqs_platform = platform),
+      error = function(e) NULL)
+    if (!is.null(m) && length(m) && !is.null(m[[1]]) && nrow(m[[1]]))
+      apt <- unique(unlist(m[[1]]$packages))
+  }
+  # Network fallback only for packages that DECLARE sysreqs but did not match.
+  if (length(apt) == 0L && has_text && !is.null(pkgname) && nzchar(pkgname)) {
+    p   <- strsplit(platform, "-", fixed = TRUE)[[1]]
+    url <- sprintf(paste0("https://packagemanager.posit.co/__api__/repos/1/",
+                          "sysreqs?all=false&pkgname=%s&distribution=%s&release=%s"),
+                   utils::URLencode(pkgname), p[1], p[2])
+    js  <- tryCatch(jsonlite::fromJSON(url, simplifyVector = FALSE),
+                    error = function(e) NULL)
+    if (length(js$requirements))
+      apt <- unique(unlist(lapply(js$requirements,
+                                  function(r) unlist(r$requirements$packages))))
+  }
+  apt[nzchar(apt)]
+}
+
+#' Install the target package's system requirements as apt -dev packages,
+#' before covr recompiles it from source. Best-effort: a resolution or apt
+#' failure never aborts, so a genuinely missing library is still recorded as
+#' build_fail by covr exactly as before. Returns (invisibly) the apt packages
+#' it attempted.
+install_sysreqs <- function(pkgdir) {
+  desc <- tryCatch(read.dcf(file.path(pkgdir, "DESCRIPTION")),
+                   error = function(e) NULL)
+  if (is.null(desc)) return(invisible(character(0)))
+  g   <- function(f) if (f %in% colnames(desc)) desc[1, f] else ""
+  apt <- .resolve_sysreqs_apt(g("SystemRequirements"), pkgname = g("Package"))
+  apt <- setdiff(apt, ls(.SYSREQS_DONE))
+  if (length(apt) == 0L) return(invisible(character(0)))
+  # Runs in the parent process (outside the covr timeout), so bound it with
+  # `timeout` in case an apt mirror stalls; a hang here would otherwise stall
+  # the whole shard.
+  ok <- tryCatch(
+    identical(0L, suppressWarnings(system2(
+      "timeout", c("300", "apt-get", "install", "-y", "--no-install-recommends", apt),
+      stdout = FALSE, stderr = FALSE, env = "DEBIAN_FRONTEND=noninteractive"))),
+    error = function(e) FALSE)
+  if (isTRUE(ok)) for (a in apt) assign(a, TRUE, envir = .SYSREQS_DONE)
+  invisible(apt)
 }
 
 #' covr's package_coverage() installs the package with tracing hooks and then
@@ -205,8 +297,8 @@ function_coverage <- function(cov) {
                    path = pkgdir)
     list(
       summary = summarise_coverage(cov),
-      file    = cbind(package = package, version = version, file_coverage(cov)),
-      func    = cbind(package = package, version = version, function_coverage(cov)),
+      file    = .tag_pv(file_coverage(cov), package, version),
+      func    = .tag_pv(function_coverage(cov), package, version),
       raw     = serialize(cov, connection = NULL)
     )
   }, error = function(e) NULL)
@@ -301,13 +393,13 @@ function_coverage <- function(cov) {
                  summary = recovered$summary, file = recovered$file,
                  func = recovered$func, raw = recovered$raw))
     }
-    status <- if (grepl("compilation failed|non-zero exit", cov$msg)) "build_fail" else "covr_error"
+    status <- if (.is_build_failure(cov$msg)) "build_fail" else "covr_error"
     return(list(status = status, fail_reason = substr(cov$msg, 1, 300)))
   }
 
   s   <- summarise_coverage(cov)
-  fcv <- cbind(package = package, version = version, file_coverage(cov))
-  fnv <- cbind(package = package, version = version, function_coverage(cov))
+  fcv <- .tag_pv(file_coverage(cov), package, version)
+  fnv <- .tag_pv(function_coverage(cov), package, version)
   raw <- serialize(cov, connection = NULL)
 
   if (.warn_is_test_failure(test_warnings)) {
@@ -351,6 +443,12 @@ run_unit_dir <- function(package, version, pkgdir, timeout_s = PER_UNIT_TIMEOUT_
   }
 
   if (!.has_tests(pkgdir)) return(finish("no_tests"))
+
+  # Pre-seed the target's build-time system libraries (apt -dev packages) so
+  # covr can recompile it from source. Done here in the parent process, before
+  # the timed covr subprocess, so apt time is not charged against the per-unit
+  # timeout and a retried subprocess does not re-install. Best-effort.
+  try(install_sysreqs(pkgdir), silent = TRUE)
 
   repo_root <- .PIPELINE_ROOT
   wr <- tryCatch(
