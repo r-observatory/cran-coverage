@@ -17,16 +17,19 @@ jobs:
       - name: Install R deps + covr
         run: |
           set -euo pipefail
-          apt-get update -qq
-          # The rolling r2u image can carry an rlang built against an older R
-          # whose .so then fails to resolve R internals (e.g. SETLENGTH) under
-          # the current R. apt keeps it (same version string), so bring R and
-          # the base compiled stack to the current repo, then force-reinstall
-          # rlang so its binary matches the running R.
-          apt-get -y dist-upgrade
+          # r2u can be transiently unreachable; tolerate a stale index. The
+          # rolling image can also carry an rlang built against an older R whose
+          # .so fails to resolve SETLENGTH under the current R, so bring the base
+          # stack current and force-reinstall rlang so its binary matches.
+          apt-get update -qq || true
+          apt-get -y dist-upgrade || true
           apt-get install -y --no-install-recommends r-cran-covr r-cran-testthat \
-            r-cran-dbi r-cran-rsqlite r-cran-jsonlite r-cran-callr r-cran-pkgdepends \
+            r-cran-dbi r-cran-rsqlite r-cran-jsonlite r-cran-callr \
             pkg-config libcurl4-openssl-dev libssl-dev
-          apt-get install -y --reinstall r-cran-rlang
+          # pkgdepends is r2u-only; best-effort so a transient r2u outage does
+          # not fail the job (the sysreqs tests skip when it is absent).
+          apt-get install -y --no-install-recommends r-cran-pkgdepends \
+            || echo "r-cran-pkgdepends unavailable; sysreqs tests will skip"
+          apt-get install -y --reinstall r-cran-rlang || true
       - name: Run unit tests
         run: Rscript tests/testthat.R

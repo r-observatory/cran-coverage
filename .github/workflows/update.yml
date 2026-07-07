@@ -71,15 +71,24 @@ jobs:
       - name: System + R dependencies
         run: |
           set -euo pipefail
-          apt-get update -qq
-          # Keep R and its compiled packages in lockstep with the rolling repo,
-          # then force-reinstall rlang so a stale image copy (same version, older
-          # R ABI) cannot fail to resolve R internals like SETLENGTH.
-          apt-get -y dist-upgrade
+          # The r2u repo can be transiently unreachable; tolerate a stale index
+          # rather than failing the job. The critical install below still
+          # hard-fails if a genuinely required package is unavailable.
+          apt-get update -qq || true
+          # Keep R and its compiled packages in lockstep with the rolling repo.
+          apt-get -y dist-upgrade || true
           apt-get install -y --no-install-recommends git curl gh jq \
             r-cran-covr r-cran-testthat r-cran-dbi r-cran-rsqlite r-cran-jsonlite \
-            r-cran-callr r-cran-pkgdepends pkg-config libcurl4-openssl-dev libssl-dev libxml2-dev
-          apt-get install -y --reinstall r-cran-rlang
+            r-cran-callr pkg-config libcurl4-openssl-dev libssl-dev libxml2-dev
+          # pkgdepends (SystemRequirements resolution) lives only in the r2u
+          # repo, so a transient r2u outage makes it unlocatable. Best-effort:
+          # without it, sysreqs resolution falls back to the Posit PPM API.
+          apt-get install -y --no-install-recommends r-cran-pkgdepends \
+            || echo "r-cran-pkgdepends unavailable (r2u transient?); sysreqs resolution will use the HTTP fallback"
+          # Force-reinstall rlang so a stale image copy (same version, older R
+          # ABI) cannot fail to resolve SETLENGTH; best-effort, the shard loop's
+          # retry covers a transient library issue if this cannot run.
+          apt-get install -y --reinstall r-cran-rlang || true
       - name: Download this runner's prior shard database
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
