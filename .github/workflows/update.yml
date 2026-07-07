@@ -34,7 +34,10 @@ jobs:
       - name: Ensure the rolling release exists
         run: |
           set -euo pipefail
-          if ! gh release view current >/dev/null 2>&1; then
+          if gh release view current >/dev/null 2>&1; then
+            echo "rolling release 'current' already exists; nothing to bootstrap"
+          else
+            echo "creating rolling release 'current'"
             gh release create current \
               --target "$GITHUB_SHA" \
               --title "CRAN Coverage (rolling)" \
@@ -127,6 +130,7 @@ jobs:
           BUDGET="${{ inputs.time_budget_seconds || '18000' }}"
           SHARD_ASSET="cran-coverage-shard-${SHARD_INDEX}.db"
           PRIOR_ROWS=$(cat out/.prior_rows 2>/dev/null || echo 0)
+          echo "partition ${SHARD_INDEX}/${SHARD_COUNT} | budget ${BUDGET}s | starting from ${PRIOR_ROWS} banked rows"
           # Publish this runner's shard DB and raw tarballs. Called after every
           # shard, including a failed one, so partial per-package progress is
           # never lost. Only this runner ever writes cran-coverage-shard-<i>.db,
@@ -138,7 +142,12 @@ jobs:
             if [ -f out/cran-coverage.db ]; then
               NEW_ROWS=$(Rscript -e 'source("scripts/export.R"); cat(summary_row_count("out/cran-coverage.db"))' 2>/dev/null || echo 0)
               if [ "$NEW_ROWS" -gt 0 ] && [ "$NEW_ROWS" -ge "$PRIOR_ROWS" ]; then
-                gh release upload current "out/cran-coverage.db#${SHARD_ASSET}" --clobber || true
+                # Upload under the shard's own asset name. `gh` treats file#name
+                # as a display LABEL, not the asset filename, so a copy named for
+                # the asset is the only way to avoid every runner clobbering the
+                # canonical cran-coverage.db.
+                cp -f out/cran-coverage.db "out/${SHARD_ASSET}"
+                gh release upload current "out/${SHARD_ASSET}" --clobber || true
               else
                 echo "refusing to publish shard DB: new rows ($NEW_ROWS) < prior rows ($PRIOR_ROWS); keeping the released shard"
               fi
@@ -207,6 +216,7 @@ jobs:
           shopt -s nullglob
           files=(shards/cran-coverage-shard-*.db)
           if [ ${#files[@]} -eq 0 ]; then echo "no shard databases to merge yet"; exit 0; fi
+          echo "merging ${#files[@]} shard database(s): ${files[*]}"
           # Prior canonical row count, so we never publish a smaller merged DB.
           PRIOR=0
           if gh release view current --json assets -q '.assets[].name' | grep -qx cran-coverage.db; then
@@ -224,7 +234,10 @@ jobs:
             echo "refusing to publish merged DB (${MERGED} rows) over the prior canonical (${PRIOR} rows)"
             exit 0
           fi
-          gh release upload current "out-cran-coverage.db#cran-coverage.db" --clobber || true
+          # Publish under the exact asset name consumers read. gh's file#name is
+          # a display label, not a rename, so copy to the target filename first.
+          cp -f out-cran-coverage.db cran-coverage.db
+          gh release upload current cran-coverage.db --clobber || true
       - name: Publish collection summary
         if: always()
         run: |
