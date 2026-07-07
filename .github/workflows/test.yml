@@ -7,15 +7,26 @@ jobs:
   test:
     runs-on: ubuntu-latest
     container: rocker/r2u:noble
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Install R deps + covr
         run: |
+          set -euo pipefail
           apt-get update -qq
+          # The rolling r2u image can carry an rlang built against an older R
+          # whose .so then fails to resolve R internals (e.g. SETLENGTH) under
+          # the current R. apt keeps it (same version string), so bring R and
+          # the base compiled stack to the current repo, then force-reinstall
+          # rlang so its binary matches the running R.
+          apt-get -y dist-upgrade
           apt-get install -y --no-install-recommends r-cran-covr r-cran-testthat \
             r-cran-dbi r-cran-rsqlite r-cran-jsonlite r-cran-callr pkg-config \
             libcurl4-openssl-dev libssl-dev
+          apt-get install -y --reinstall r-cran-rlang
       - name: Run unit tests
         run: Rscript tests/testthat.R
