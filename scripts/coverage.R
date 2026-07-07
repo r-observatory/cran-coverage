@@ -18,7 +18,13 @@ apply_determinism <- function(seed = COVERAGE_SEED) {
   Sys.setenv(
     LC_ALL = "en_US.UTF-8", LANG = "en_US.UTF-8", TZ = "UTC",
     NOT_CRAN = "true", OMP_NUM_THREADS = "1", R_COVR = "true",
-    TESTTHAT_CPUS = "1", `_R_CHECK_LIMIT_CORES_` = "true"
+    TESTTHAT_CPUS = "1", `_R_CHECK_LIMIT_CORES_` = "true",
+    # Compile the instrumented target in parallel (make -j) to use the runner's
+    # extra cores on heavy compiled packages. This is independent of test
+    # execution, which stays single-threaded above (OMP/mc.cores) so covr does
+    # not lose coverage from forked workers. Capped at 2 for memory headroom
+    # under the container cap on RcppEigen-heavy compiles.
+    MAKEFLAGS = "-j2"
   )
   options(mc.cores = 1L, Ncpus = 1L, covr.gcov = Sys.which("gcov"))
   suppressWarnings(try(Sys.setlocale("LC_ALL", "en_US.UTF-8"), silent = TRUE))
