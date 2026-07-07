@@ -377,6 +377,14 @@ install_sysreqs <- function(pkgdir) {
   source("scripts/config.R")
   source("scripts/sources.R")
   source("scripts/coverage.R")
+  # Install dependencies as r2u apt binaries (bspm). callr does not load the
+  # system profile that normally enables bspm, so without this a compiled
+  # dependency (e.g. systemfonts, ragg) installs from source and fails without
+  # its own system libraries -- which cascades to break its dependents
+  # (textshaping, tidyverse, ...). Binaries pull their runtime libs via apt, so
+  # dependency system requirements are handled without resolving them per-dep.
+  # Best-effort: a no-op where bspm is absent (e.g. the local test suite).
+  suppressMessages(try(bspm::enable(), silent = TRUE))
   apply_determinism()
 
   if (identical(mode, "type_pct")) {
