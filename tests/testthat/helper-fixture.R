@@ -31,6 +31,19 @@ make_failing_pkg <- function() {
   d
 }
 
+#' A package that fails to INSTALL: its R source has a syntax error, so
+#' `R CMD INSTALL` (and covr's instrumented install) fails during parse/
+#' lazy-load. Used to check that a build failure carries the real install
+#' error rather than covr's generic "Package installation did not succeed."
+make_broken_pkg <- function() {
+  d <- tempfile("covbroken_"); dir.create(file.path(d, "R"), recursive = TRUE)
+  writeLines(c("Package: covbroken", "Version: 1.0", "Title: t", "Description: t.",
+               "License: MIT"), file.path(d, "DESCRIPTION"))
+  writeLines("export(add)", file.path(d, "NAMESPACE"))
+  writeLines("add <- function(a, b) { a + b", file.path(d, "R", "f.R"))  # unbalanced brace
+  d
+}
+
 #' A package whose test never returns (it sleeps far longer than any
 #' per-unit timeout used in tests, and could not be interrupted by a
 #' cooperative R-evaluator timeout like R.utils::withTimeout, since covr

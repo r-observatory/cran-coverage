@@ -80,13 +80,24 @@ test_that("select_shard orders by popularity rank, then alphabetically", {
                c("ggplot2", "zzz", "aaa"))
 })
 
-test_that("select_shard prioritizes never-attempted work over re-attempts", {
+test_that("select_shard prioritizes never-attempted work over re-attempts among unranked packages", {
   uni <- data.frame(package = c("fresh", "flaky"), latest_version = c("1", "1"),
                     stringsAsFactors = FALSE)
   state <- data.frame(package = "flaky", version = "1", covr_status = "timeout",
                       attempts = 1L, stringsAsFactors = FALSE)
-  # both are todo, but the never-attempted one comes first
+  # both are todo and unranked, so the never-attempted one comes first
   expect_equal(select_shard(uni, state, 1L), "fresh")
+})
+
+test_that("select_shard re-tries a popular failure ahead of an obscure new package", {
+  uni <- data.frame(package = c("popfail", "obscure"), latest_version = c("1", "1"),
+                    stringsAsFactors = FALSE)
+  state <- data.frame(package = "popfail", version = "1", covr_status = "build_fail",
+                      attempts = 1L, stringsAsFactors = FALSE)
+  rank <- c("popfail")   # popfail is popular; obscure is unranked
+  # a retryable failure that is popular is tried at its rank, ahead of an
+  # obscure never-attempted package, so fixes (e.g. sysreqs) reach it soon
+  expect_equal(select_shard(uni, state, 1L, rank = rank), "popfail")
 })
 
 test_that("select_shard restricts to its matrix partition", {
