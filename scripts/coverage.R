@@ -245,9 +245,12 @@ install_sysreqs <- function(pkgdir) {
   apt <- .resolve_sysreqs_apt(g("SystemRequirements"), pkgname = g("Package"))
   apt <- setdiff(apt, ls(.SYSREQS_DONE))
   if (length(apt) == 0L) return(invisible(character(0)))
+  # Runs in the parent process (outside the covr timeout), so bound it with
+  # `timeout` in case an apt mirror stalls; a hang here would otherwise stall
+  # the whole shard.
   ok <- tryCatch(
     identical(0L, suppressWarnings(system2(
-      "apt-get", c("install", "-y", "--no-install-recommends", apt),
+      "timeout", c("300", "apt-get", "install", "-y", "--no-install-recommends", apt),
       stdout = FALSE, stderr = FALSE, env = "DEBIAN_FRONTEND=noninteractive"))),
     error = function(e) FALSE)
   if (isTRUE(ok)) for (a in apt) assign(a, TRUE, envir = .SYSREQS_DONE)
