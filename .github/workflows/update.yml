@@ -34,7 +34,10 @@ jobs:
       - name: Ensure the rolling release exists
         run: |
           set -euo pipefail
-          if ! gh release view current >/dev/null 2>&1; then
+          if gh release view current >/dev/null 2>&1; then
+            echo "rolling release 'current' already exists; nothing to bootstrap"
+          else
+            echo "creating rolling release 'current'"
             gh release create current \
               --target "$GITHUB_SHA" \
               --title "CRAN Coverage (rolling)" \
@@ -127,6 +130,7 @@ jobs:
           BUDGET="${{ inputs.time_budget_seconds || '18000' }}"
           SHARD_ASSET="cran-coverage-shard-${SHARD_INDEX}.db"
           PRIOR_ROWS=$(cat out/.prior_rows 2>/dev/null || echo 0)
+          echo "partition ${SHARD_INDEX}/${SHARD_COUNT} | budget ${BUDGET}s | starting from ${PRIOR_ROWS} banked rows"
           # Publish this runner's shard DB and raw tarballs. Called after every
           # shard, including a failed one, so partial per-package progress is
           # never lost. Only this runner ever writes cran-coverage-shard-<i>.db,
@@ -207,6 +211,7 @@ jobs:
           shopt -s nullglob
           files=(shards/cran-coverage-shard-*.db)
           if [ ${#files[@]} -eq 0 ]; then echo "no shard databases to merge yet"; exit 0; fi
+          echo "merging ${#files[@]} shard database(s): ${files[*]}"
           # Prior canonical row count, so we never publish a smaller merged DB.
           PRIOR=0
           if gh release view current --json assets -q '.assets[].name' | grep -qx cran-coverage.db; then
