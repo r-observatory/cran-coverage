@@ -245,11 +245,18 @@ jobs:
           files=(shards/cran-coverage-shard-*.db)
           if [ ${#files[@]} -eq 0 ]; then echo "no shard databases to merge yet"; exit 0; fi
           echo "merging ${#files[@]} shard database(s): ${files[*]}"
-          # Prior canonical row count, so we never publish a smaller merged DB.
+          # Start the merge FROM the current canonical (monotonic merge): the
+          # shards are upserted onto it, so a failed or stale shard can never
+          # drop rows or freeze recoveries -- only the packages a shard actually
+          # carries are updated, the rest are preserved. PRIOR is the guard
+          # floor: never publish fewer rows than the canonical already has.
           PRIOR=0
           if gh release view "$PUBLIC_TAG" --json assets -q '.assets[].name' | grep -qx cran-coverage.db; then
             gh release download "$PUBLIC_TAG" --pattern cran-coverage.db --dir prior || true
             PRIOR=$(Rscript -e 'source("scripts/export.R"); cat(summary_row_count("prior/cran-coverage.db"))' 2>/dev/null || echo 0)
+            if [ -f prior/cran-coverage.db ] && [ "$PRIOR" -gt 0 ]; then
+              cp -f prior/cran-coverage.db out-cran-coverage.db
+            fi
           fi
           MERGED=$(Rscript -e '
             source("scripts/export.R")
