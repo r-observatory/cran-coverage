@@ -17,3 +17,8 @@ COVR_TYPES        <- c("tests", "examples", "vignettes")
 # test_error, and ok are terminal outcomes and are never re-attempted.
 MAX_ATTEMPTS      <- 3L
 RETRYABLE_STATUS  <- c("build_fail", "covr_error", "timeout")
+
+# Platform key for resolving a package's SystemRequirements to apt packages.
+# Hardcoded because the collect container is pinned to rocker/r2u:noble
+# (Ubuntu 24.04); revisit if the base image changes.
+SYSREQS_PLATFORM  <- "ubuntu-24.04"

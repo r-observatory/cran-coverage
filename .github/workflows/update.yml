@@ -78,7 +78,7 @@ jobs:
           apt-get -y dist-upgrade
           apt-get install -y --no-install-recommends git curl gh jq \
             r-cran-covr r-cran-testthat r-cran-dbi r-cran-rsqlite r-cran-jsonlite \
-            r-cran-callr pkg-config libcurl4-openssl-dev libssl-dev libxml2-dev
+            r-cran-callr r-cran-pkgdepends pkg-config libcurl4-openssl-dev libssl-dev libxml2-dev
           apt-get install -y --reinstall r-cran-rlang
       - name: Download this runner's prior shard database
         env:
