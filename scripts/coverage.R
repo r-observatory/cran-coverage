@@ -242,19 +242,25 @@ install_sysreqs <- function(pkgdir) {
                    error = function(e) NULL)
   if (is.null(desc)) return(invisible(character(0)))
   g   <- function(f) if (f %in% colnames(desc)) desc[1, f] else ""
-  apt <- .resolve_sysreqs_apt(g("SystemRequirements"), pkgname = g("Package"))
-  apt <- setdiff(apt, ls(.SYSREQS_DONE))
-  if (length(apt) == 0L) return(invisible(character(0)))
+  sr  <- g("SystemRequirements")
+  apt <- .resolve_sysreqs_apt(sr, pkgname = g("Package"))
+  todo <- setdiff(apt, ls(.SYSREQS_DONE))
+  if (length(todo) == 0L) {
+    if (nzchar(trimws(sr)) && length(apt) == 0L)
+      message(sprintf("    sysreqs: '%s' resolved to no apt packages", trimws(sr)))
+    return(invisible(character(0)))
+  }
   # Runs in the parent process (outside the covr timeout), so bound it with
   # `timeout` in case an apt mirror stalls; a hang here would otherwise stall
-  # the whole shard.
-  ok <- tryCatch(
-    identical(0L, suppressWarnings(system2(
-      "timeout", c("300", "apt-get", "install", "-y", "--no-install-recommends", apt),
-      stdout = FALSE, stderr = FALSE, env = "DEBIAN_FRONTEND=noninteractive"))),
-    error = function(e) FALSE)
-  if (isTRUE(ok)) for (a in apt) assign(a, TRUE, envir = .SYSREQS_DONE)
-  invisible(apt)
+  # the whole shard. The exit code is logged so a failed install is visible.
+  message(sprintf("    sysreqs: apt-get install %s", paste(todo, collapse = " ")))
+  code <- tryCatch(suppressWarnings(system2(
+      "timeout", c("300", "apt-get", "install", "-y", "--no-install-recommends", todo),
+      stdout = FALSE, stderr = FALSE, env = "DEBIAN_FRONTEND=noninteractive")),
+    error = function(e) -1L)
+  message(sprintf("    sysreqs: apt-get exit %s", code))
+  if (identical(as.integer(code), 0L)) for (a in todo) assign(a, TRUE, envir = .SYSREQS_DONE)
+  invisible(todo)
 }
 
 #' covr's package_coverage() installs the package with tracing hooks and then
