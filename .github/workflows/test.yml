@@ -31,5 +31,10 @@ jobs:
           apt-get install -y --no-install-recommends r-cran-pkgdepends \
             || echo "r-cran-pkgdepends unavailable; sysreqs tests will skip"
           apt-get install -y --reinstall r-cran-rlang || true
+          # If the rolling rlang binary is built against a different R ABI
+          # (undefined symbol SETLENGTH), rebuild it from source against this R.
+          Rscript -e 'loadNamespace("rlang")' >/dev/null 2>&1 \
+            || Rscript -e 'install.packages("rlang", repos = "https://cloud.r-project.org", type = "source")' \
+            || true
       - name: Run unit tests
         run: Rscript tests/testthat.R
