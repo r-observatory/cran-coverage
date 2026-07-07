@@ -67,10 +67,16 @@ jobs:
           persist-credentials: false
       - name: System + R dependencies
         run: |
+          set -euo pipefail
           apt-get update -qq
+          # Keep R and its compiled packages in lockstep with the rolling repo,
+          # then force-reinstall rlang so a stale image copy (same version, older
+          # R ABI) cannot fail to resolve R internals like SETLENGTH.
+          apt-get -y dist-upgrade
           apt-get install -y --no-install-recommends git curl gh jq \
             r-cran-covr r-cran-testthat r-cran-dbi r-cran-rsqlite r-cran-jsonlite \
             r-cran-callr pkg-config libcurl4-openssl-dev libssl-dev libxml2-dev
+          apt-get install -y --reinstall r-cran-rlang
       - name: Download this runner's prior shard database
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -188,7 +194,9 @@ jobs:
           persist-credentials: false
       - name: Merge dependencies
         run: |
+          set -euo pipefail
           apt-get update -qq
+          apt-get -y dist-upgrade
           apt-get install -y --no-install-recommends gh jq \
             r-cran-dbi r-cran-rsqlite r-cran-jsonlite
       - name: Merge shard databases and publish the canonical database
