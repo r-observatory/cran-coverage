@@ -4,7 +4,10 @@ SHARD_SIZE        <- 10L                 # units per shard; kept small so each s
                                          # and uploads well inside the job timeout, making
                                          # progress durable even when heavy packages are slow
 DB_FILENAME       <- "cran-coverage.db"
-PER_UNIT_TIMEOUT_S <- 1200L              # 20 min hard cap per package
+PER_UNIT_TIMEOUT_S <- 1800L              # 30 min hard cap per covr pass; covr
+                                         # instrumentation plus NOT_CRAN tests
+                                         # make heavy suites (e.g. renv) exceed
+                                         # 20 min
 COVERAGE_SEED     <- 20260704L
 COVR_TYPES        <- c("tests", "examples", "vignettes")
 
