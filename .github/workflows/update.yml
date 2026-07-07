@@ -84,6 +84,7 @@ jobs:
       - name: System + R dependencies
         run: |
           set -euo pipefail
+          echo "runner: $(nproc) cores, $(free -h 2>/dev/null | awk '/^Mem/{print $2}') RAM"
           # The r2u repo can be transiently unreachable; tolerate a stale index
           # rather than failing the job. The critical install below still
           # hard-fails if a genuinely required package is unavailable.
