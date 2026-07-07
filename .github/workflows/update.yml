@@ -121,13 +121,19 @@ jobs:
             mv "out/$SHARD_ASSET" out/cran-coverage.db
             PRIOR_ROWS=$(Rscript -e 'source("scripts/export.R"); cat(summary_row_count("out/cran-coverage.db"))')
             if [ "$PRIOR_ROWS" -eq 0 ]; then
-              echo "prior shard DB present but downloaded empty/corrupt; aborting to avoid clobbering it"
-              exit 1
+              # The published shard is fine (only the merge writes it, guarded),
+              # so an empty read here is a transient bad download. Discard it and
+              # re-seed from the canonical below rather than failing the job; that
+              # sets PRIOR_ROWS from banked coverage, so publish still cannot
+              # clobber the good shard with a smaller one.
+              echo "prior shard DB downloaded empty/unreadable; re-seeding this partition from the canonical"
+              rm -f out/cran-coverage.db
             fi
-          elif echo "$ASSETS_PUB" | grep -qx cran-coverage.db; then
-            # Cutover / self-heal: no per-runner shard yet, but the canonical DB
-            # exists. Seed this runner from just its partition of the canonical
-            # so it resumes instead of recomputing coverage we already have.
+          fi
+          # Cutover / self-heal: no usable shard DB, but the canonical exists.
+          # Seed this runner from just its partition of the canonical so it
+          # resumes instead of recomputing coverage we already have.
+          if [ "$PRIOR_ROWS" -eq 0 ] && echo "$ASSETS_PUB" | grep -qx cran-coverage.db; then
             gh release download "$PUBLIC_TAG" --pattern cran-coverage.db --dir canon
             PRIOR_ROWS=$(Rscript -e '
               for (s in c("config.R","export.R","update.R")) source(file.path("scripts", s))
