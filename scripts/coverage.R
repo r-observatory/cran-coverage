@@ -50,8 +50,12 @@ coverage_fingerprint <- function(seed = COVERAGE_SEED) {
 #' ABI with it. The HTTPUserAgent header is what makes PPM serve binaries (for
 #' this exact R) rather than source; bspm is turned off so it cannot divert the
 #' install back to the rolling apt repo. Returns the repo URL.
+#' URL of the dated Posit PPM Ubuntu-noble repository for a snapshot.
+ppm_url <- function(snapshot = PPM_SNAPSHOT)
+  sprintf("https://packagemanager.posit.co/cran/__linux__/noble/%s", snapshot)
+
 use_ppm_source <- function(snapshot = PPM_SNAPSHOT) {
-  url <- sprintf("https://packagemanager.posit.co/cran/__linux__/noble/%s", snapshot)
+  url <- ppm_url(snapshot)
   options(
     repos = c(PPM = url),
     HTTPUserAgent = sprintf(
@@ -238,8 +242,10 @@ function_coverage <- function(cov) {
 
 # System requirements: covr recompiles the TARGET from source under
 # instrumentation, so it needs the target's build-time system libraries
-# (-dev headers). Dependencies stay as r2u binaries and already pull their
-# runtime libs, so only the target's own SystemRequirements must be resolved.
+# (-dev headers). Under r2u, dependency binaries pull their own runtime libs, so
+# only the target's SystemRequirements are resolved; under PPM, binaries do NOT
+# auto-install system libs, so the whole dependency tree's requirements are
+# resolved too (install_sysreqs branches on PACKAGE_SOURCE).
 
 # Session cache of apt packages already installed this run, so a system library
 # a prior package pulled in is not re-shelled through apt-get.
@@ -279,6 +285,60 @@ function_coverage <- function(cov) {
   apt[nzchar(apt)]
 }
 
+# Cached available.packages() from the PPM snapshot, carrying SystemRequirements,
+# so the dependency tree's sysreqs are resolved without a network hit per
+# package. install_sysreqs runs in the parent process, so this persists across a
+# shard's packages.
+.PPM_DB <- new.env(parent = emptyenv())
+.ppm_db <- function() {
+  if (is.null(.PPM_DB$db))
+    .PPM_DB$db <- tryCatch(
+      available.packages(repos = ppm_url(), fields = "SystemRequirements"),
+      error = function(e) NULL)
+  .PPM_DB$db
+}
+
+#' Recursive hard-dependency names (Depends/Imports/LinkingTo) of the target,
+#' expanded over an available.packages() `db`. Base and absent packages fall out
+#' naturally (they are not in the db); R is dropped.
+.dep_tree <- function(pkgdir, db) {
+  desc <- tryCatch(read.dcf(file.path(pkgdir, "DESCRIPTION")),
+                   error = function(e) NULL)
+  if (is.null(desc)) return(character(0))
+  fld <- function(f) if (f %in% colnames(desc)) desc[1, f] else ""
+  parse_deps <- function(s) {
+    x <- trimws(unlist(strsplit(s, ",")))
+    x <- sub("\\s*\\(.*", "", x)
+    x[nzchar(x) & x != "R"]
+  }
+  direct <- unique(c(parse_deps(fld("Depends")), parse_deps(fld("Imports")),
+                     parse_deps(fld("LinkingTo"))))
+  rec <- tryCatch(
+    unlist(tools::package_dependencies(direct, db, recursive = TRUE,
+             which = c("Depends", "Imports", "LinkingTo")), use.names = FALSE),
+    error = function(e) character(0))
+  setdiff(unique(c(direct, rec)), "R")
+}
+
+#' Resolve apt packages for the target's SystemRequirements AND every package in
+#' its recursive dependency tree (each dep's SystemRequirements read from `db`).
+#' The PPM path: PPM binaries do not auto-install their system libraries, so the
+#' whole tree must be pre-seeded, not just the target.
+.resolve_tree_sysreqs_apt <- function(pkgdir, db, platform = SYSREQS_PLATFORM) {
+  desc <- tryCatch(read.dcf(file.path(pkgdir, "DESCRIPTION")),
+                   error = function(e) NULL)
+  g <- function(f) if (!is.null(desc) && f %in% colnames(desc)) desc[1, f] else ""
+  apt <- .resolve_sysreqs_apt(g("SystemRequirements"), pkgname = g("Package"),
+                              platform = platform)
+  have_sr <- !is.null(db) && "SystemRequirements" %in% colnames(db)
+  for (d in intersect(.dep_tree(pkgdir, db), rownames(db))) {
+    sr <- if (have_sr) db[d, "SystemRequirements"] else NA_character_
+    if (!is.na(sr) && nzchar(trimws(sr)))
+      apt <- c(apt, .resolve_sysreqs_apt(sr, pkgname = d, platform = platform))
+  }
+  unique(apt[nzchar(apt)])
+}
+
 #' Install the target package's system requirements as apt -dev packages,
 #' before covr recompiles it from source. Best-effort: a resolution or apt
 #' failure never aborts, so a genuinely missing library is still recorded as
@@ -290,7 +350,15 @@ install_sysreqs <- function(pkgdir) {
   if (is.null(desc)) return(invisible(character(0)))
   g   <- function(f) if (f %in% colnames(desc)) desc[1, f] else ""
   sr  <- g("SystemRequirements")
-  apt <- .resolve_sysreqs_apt(sr, pkgname = g("Package"))
+  apt <- if (identical(PACKAGE_SOURCE, "ppm")) {
+    # PPM binaries do not auto-install their runtime libs, so resolve the whole
+    # dependency tree's system requirements, not just the target's.
+    .resolve_tree_sysreqs_apt(pkgdir, .ppm_db())
+  } else {
+    # r2u/bspm binaries pull their own runtime libs, so only the target (which
+    # covr recompiles from source) needs its build-time libraries resolved.
+    .resolve_sysreqs_apt(sr, pkgname = g("Package"))
+  }
   todo <- setdiff(apt, ls(.SYSREQS_DONE))
   if (length(todo) == 0L) {
     if (nzchar(trimws(sr)) && length(apt) == 0L)

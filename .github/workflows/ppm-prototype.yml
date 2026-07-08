@@ -1,12 +1,10 @@
-name: PPM Prototype
-# Manually-triggered de-risking spike: run the real coverage path with
-# dependencies pulled from a dated Posit PPM Ubuntu-noble binary snapshot
-# instead of the rolling r2u apt repo, to check that binaries install cleanly
-# (no ABI drift), covr works, results match r2u, and it is fast enough. Does
-# not touch the production releases.
+name: PPM Snapshot Check
+# Manual smoke test for a PPM Ubuntu-noble snapshot before adopting it: runs the
+# real coverage path with dependencies pulled from the snapshot on a
+# dependency-heavy probe set, to confirm binaries install cleanly (no ABI
+# drift), covr works, and results look right. Dispatch it with a new date before
+# bumping PPM_SNAPSHOT in update.yml. Does not touch the production releases.
 on:
-  push:
-    branches: [ppm-prototype]
   workflow_dispatch:
     inputs:
       snapshot:
