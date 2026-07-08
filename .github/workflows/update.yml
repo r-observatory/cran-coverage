@@ -27,6 +27,12 @@ env:
   # A hidden prerelease holding the pipeline's internal state (per-runner shard
   # databases and raw covr objects), so the public release stays clean.
   INTERNAL_TAG: internal
+  # Install R package dependencies from a dated Posit PPM Ubuntu-noble binary
+  # snapshot instead of the rolling r2u apt repo, so binaries are always built
+  # against the pinned R and never drift out of ABI with it. Bump the date
+  # deliberately (in step with the pinned image digest below) to move forward.
+  PACKAGE_SOURCE: ppm
+  PPM_SNAPSHOT: "2026-07-01"
 jobs:
   # Make sure both releases exist before the matrix fans out, so the runners do
   # not race to create them.
@@ -61,7 +67,10 @@ jobs:
     needs: bootstrap
     runs-on: ubuntu-latest
     container:
-      image: rocker/r2u:noble
+      # Pinned by digest so the base R stays fixed (paired with the PPM snapshot
+      # date above); this is what removes the rolling-image ABI drift. Bump the
+      # digest and PPM_SNAPSHOT together. This digest is rocker/r2u:noble = R 4.6.1.
+      image: rocker/r2u:noble@sha256:816279dd028627eef4c06416a25fb47f8943bab5f505f81510db55d5386667c5
       # Coarse container memory cap: a runaway untrusted test suite is killed
       # rather than taking down the runner. Per-unit hangs are bounded
       # separately by the covr subprocess timeout (PER_UNIT_TIMEOUT_S).
@@ -81,50 +90,33 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: System + R dependencies
+      - name: System tools + R toolchain from PPM
         run: |
           set -euo pipefail
           echo "runner: $(nproc) cores, $(free -h 2>/dev/null | awk '/^Mem/{print $2}') RAM"
-          # The r2u repo can be transiently unreachable; tolerate a stale index
-          # rather than failing the job. The critical install below still
-          # hard-fails if a genuinely required package is unavailable.
+          R --version | head -1
           apt-get update -qq || true
-          # Keep R and its compiled packages in lockstep with the rolling repo.
-          apt-get -y dist-upgrade || true
+          # System tools + the build toolchain covr needs to recompile the target
+          # from source. R packages come from the pinned PPM snapshot (below),
+          # not apt, so their binaries are built against this exact R -- no
+          # rolling-image ABI drift, so no source-rebuild heal is needed.
           apt-get install -y --no-install-recommends git curl gh jq \
-            r-cran-covr r-cran-testthat r-cran-dbi r-cran-rsqlite r-cran-jsonlite \
-            r-cran-callr pkg-config libcurl4-openssl-dev libssl-dev libxml2-dev
-          # pkgdepends (SystemRequirements resolution) lives only in the r2u
-          # repo, so a transient r2u outage makes it unlocatable. Best-effort:
-          # without it, sysreqs resolution falls back to the Posit PPM API.
-          apt-get install -y --no-install-recommends r-cran-pkgdepends \
-            || echo "r-cran-pkgdepends unavailable (r2u transient?); sysreqs resolution will use the HTTP fallback"
-          # The rolling image can ship compiled packages built against a
-          # different R ABI than the running R (undefined symbol SETLENGTH),
-          # breaking package load at startup (rlang, bit, ...). Rebuild any such
-          # package in the pipeline's dependency tree from source against this R
-          # (ABI-correct by construction; independent of r2u's binary lag).
+            pkg-config libcurl4-openssl-dev libssl-dev libxml2-dev
+          # covr toolchain from the pinned PPM snapshot. The covr subprocess
+          # installs each target's dependencies from the same snapshot
+          # (PACKAGE_SOURCE=ppm), and install_sysreqs pre-seeds the whole
+          # dependency tree's system libraries via apt (PPM binaries, unlike r2u,
+          # do not carry them).
           Rscript -e '
-            compiled <- Filter(function(p) {
-              d <- system.file("libs", package = p)
-              nzchar(d) && length(list.files(d, pattern = "[.]so$")) > 0L
-            }, rownames(installed.packages()))
-            broken <- Filter(function(p) !isTRUE(tryCatch({loadNamespace(p); TRUE},
-                             error = function(e) FALSE)), compiled)
-            if (length(broken)) {
-              # C++ header packages (cpp11, Rcpp, ...) do not fail to load -- they
-              # are header-only, or their .so loads fine -- but their installed
-              # headers can still reference a removed R symbol (SETLENGTH), which
-              # breaks the source rebuild of everything that LinkingTo them.
-              # Refresh those headers first so the dependents can compile.
-              hdr <- intersect(c("cpp11", "Rcpp", "RcppEigen", "RcppArmadillo"),
-                               rownames(installed.packages()))
-              message("rebuilding ABI-mismatched packages from source: ",
-                      paste(unique(c(hdr, broken)), collapse = " "))
-              if (length(hdr)) install.packages(hdr, repos = "https://cloud.r-project.org", type = "source")
-              install.packages(broken, repos = "https://cloud.r-project.org", type = "source")
-            } else message("compiled stack OK")
-          ' || true
+            source("scripts/config.R"); source("scripts/coverage.R")
+            cat("PPM:", use_ppm_source(), "| R", as.character(getRversion()), "\n")
+            install.packages(c("covr","testthat","DBI","RSQLite","callr",
+                               "jsonlite","pkgdepends"))
+            need <- c("covr","testthat","DBI","RSQLite","callr","jsonlite","pkgdepends")
+            ok <- vapply(need, requireNamespace, logical(1), quietly = TRUE)
+            print(ok)
+            if (!all(ok)) { cat("FAIL: a toolchain package did not install/load\n"); quit(status = 1) }
+          '
       - name: Download this runner's prior state
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -241,7 +233,8 @@ jobs:
     needs: collect
     if: always()
     runs-on: ubuntu-latest
-    container: rocker/r2u:noble
+    # Pinned by digest, paired with PPM_SNAPSHOT (see the top-level env).
+    container: rocker/r2u:noble@sha256:816279dd028627eef4c06416a25fb47f8943bab5f505f81510db55d5386667c5
     env:
       GH_REPO: ${{ github.repository }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -252,37 +245,21 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Merge dependencies
+      - name: Merge dependencies from PPM
         run: |
           set -euo pipefail
           apt-get update -qq || true
-          apt-get -y dist-upgrade || true
-          apt-get install -y --no-install-recommends gh jq \
-            r-cran-dbi r-cran-rsqlite r-cran-jsonlite
-          # DBI/RSQLite load compiled packages (rlang, bit, ...) that the rolling
-          # image may have built against a different R ABI; rebuild any that fail
-          # to load from source against the running R.
+          apt-get install -y --no-install-recommends gh jq libcurl4-openssl-dev libssl-dev
+          # DBI/RSQLite/jsonlite from the pinned PPM snapshot (binaries matched to
+          # this R), so the merge is not exposed to the rolling-image ABI drift.
           Rscript -e '
-            compiled <- Filter(function(p) {
-              d <- system.file("libs", package = p)
-              nzchar(d) && length(list.files(d, pattern = "[.]so$")) > 0L
-            }, rownames(installed.packages()))
-            broken <- Filter(function(p) !isTRUE(tryCatch({loadNamespace(p); TRUE},
-                             error = function(e) FALSE)), compiled)
-            if (length(broken)) {
-              # C++ header packages (cpp11, Rcpp, ...) do not fail to load -- they
-              # are header-only, or their .so loads fine -- but their installed
-              # headers can still reference a removed R symbol (SETLENGTH), which
-              # breaks the source rebuild of everything that LinkingTo them.
-              # Refresh those headers first so the dependents can compile.
-              hdr <- intersect(c("cpp11", "Rcpp", "RcppEigen", "RcppArmadillo"),
-                               rownames(installed.packages()))
-              message("rebuilding ABI-mismatched packages from source: ",
-                      paste(unique(c(hdr, broken)), collapse = " "))
-              if (length(hdr)) install.packages(hdr, repos = "https://cloud.r-project.org", type = "source")
-              install.packages(broken, repos = "https://cloud.r-project.org", type = "source")
-            } else message("compiled stack OK")
-          ' || true
+            source("scripts/config.R"); source("scripts/coverage.R")
+            use_ppm_source()
+            install.packages(c("DBI","RSQLite","jsonlite"))
+            ok <- vapply(c("DBI","RSQLite","jsonlite"), requireNamespace, logical(1), quietly = TRUE)
+            print(ok)
+            if (!all(ok)) { cat("FAIL: a merge package did not install/load\n"); quit(status = 1) }
+          '
       - name: Merge shard databases and publish the canonical database
         run: |
           set -uo pipefail

@@ -21,6 +21,54 @@ test_that(".resolve_sysreqs_apt maps declared requirements and no-ops on none", 
   expect_true(all(nzchar(apt)))
 })
 
+# --- PPM full-tree system requirements ------------------------------------
+# Under PACKAGE_SOURCE=ppm the dependency binaries come from PPM, which (unlike
+# r2u/bspm) does NOT auto-install their runtime system libraries, so the whole
+# dependency tree's sysreqs must be resolved, not just the target's.
+
+.mkdb <- function(rows) {
+  cols <- c("Package", "Version", "Depends", "Imports", "LinkingTo",
+            "Suggests", "SystemRequirements")
+  m <- matrix("", nrow = length(rows), ncol = length(cols),
+              dimnames = list(names(rows), cols))
+  m[, "Package"] <- names(rows); m[, "Version"] <- "1.0"
+  for (nm in names(rows)) for (f in names(rows[[nm]])) m[nm, f] <- rows[[nm]][[f]]
+  m
+}
+
+.mkpkg_desc <- function(fields) {
+  d <- tempfile("trg_"); dir.create(d)
+  base <- c("Package: target", "Version: 1.0", "Title: t", "Description: t.",
+            "License: MIT")
+  extra <- vapply(names(fields), function(f) paste0(f, ": ", fields[[f]]),
+                  character(1))
+  writeLines(c(base, extra), file.path(d, "DESCRIPTION"))
+  d
+}
+
+test_that(".dep_tree returns the recursive hard-dependency names from the db", {
+  db <- .mkdb(list(
+    A = c(Imports = "B, C"),
+    B = c(Imports = "D"),
+    C = c(LinkingTo = "E"),
+    D = c(), E = c()
+  ))
+  pkgdir <- .mkpkg_desc(list(Imports = "A", Depends = "R (>= 4.0)"))
+  tree <- .dep_tree(pkgdir, db)
+  expect_setequal(tree, c("A", "B", "C", "D", "E"))  # recursive, R dropped
+})
+
+test_that(".resolve_tree_sysreqs_apt resolves a DEPENDENCY's sysreqs, not just the target's", {
+  skip_if_not_installed("pkgdepends")
+  # Target declares nothing; a transitive dependency declares GNU GSL. The tree
+  # resolver must still return apt packages -- proving it walked the deps.
+  db <- .mkdb(list(A = c(Imports = "B"), B = c(SystemRequirements = "GNU GSL")))
+  pkgdir <- .mkpkg_desc(list(Imports = "A"))
+  apt <- .resolve_tree_sysreqs_apt(pkgdir, db)
+  expect_true(is.character(apt) && length(apt) >= 1L)
+  expect_true(all(nzchar(apt)))
+})
+
 test_that("install_sysreqs reads the target DESCRIPTION and is best-effort", {
   rm(list = ls(.SYSREQS_DONE), envir = .SYSREQS_DONE)   # isolate from other tests
   mkpkg <- function(sysreqs) {

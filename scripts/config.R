@@ -25,3 +25,12 @@ RETRYABLE_STATUS  <- c("build_fail", "covr_error", "timeout")
 # Hardcoded because the collect container is pinned to rocker/r2u:noble
 # (Ubuntu 24.04); revisit if the base image changes.
 SYSREQS_PLATFORM  <- "ubuntu-24.04"
+
+# Where to install R package dependencies from. "r2u" (default) uses the rolling
+# rocker/r2u apt binaries via bspm. "ppm" pins install.packages to a dated Posit
+# PPM Ubuntu-noble binary snapshot, so dependency binaries always match the
+# running R and never drift out of ABI with it (the rolling-image failure mode).
+# Env-overridable so a run can pick a source without a code change.
+PACKAGE_SOURCE    <- Sys.getenv("PACKAGE_SOURCE", "r2u")
+# Dated PPM snapshot ("YYYY-MM-DD" or "latest"); only used when PACKAGE_SOURCE=ppm.
+PPM_SNAPSHOT      <- Sys.getenv("PPM_SNAPSHOT", "latest")

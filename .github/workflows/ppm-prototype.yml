@@ -1,0 +1,85 @@
+name: PPM Snapshot Check
+# Manual smoke test for a PPM Ubuntu-noble snapshot before adopting it: runs the
+# real coverage path with dependencies pulled from the snapshot on a
+# dependency-heavy probe set, to confirm binaries install cleanly (no ABI
+# drift), covr works, and results look right. Dispatch it with a new date before
+# bumping PPM_SNAPSHOT in update.yml. Does not touch the production releases.
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot:
+        description: "PPM snapshot date (YYYY-MM-DD) or 'latest'"
+        default: "2026-07-01"
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    container:
+      image: rocker/r2u:noble
+      options: --memory=14g
+    env:
+      PACKAGE_SOURCE: ppm
+      PPM_SNAPSHOT: ${{ inputs.snapshot || '2026-07-01' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Runner info + system libraries for the probe set
+        run: |
+          set -euo pipefail
+          echo "runner: $(nproc) cores, $(free -h 2>/dev/null | awk '/^Mem/{print $2}') RAM"
+          R --version | head -1
+          apt-get update -qq || true
+          # System libraries a couple of the probe packages need to build under
+          # covr; kept on apt exactly like the production sysreqs path.
+          apt-get install -y --no-install-recommends \
+            pkg-config libcurl4-openssl-dev libssl-dev libxml2-dev libicu-dev || true
+      - name: Install the covr toolchain from PPM (binaries, matched to this R)
+        run: |
+          set -euo pipefail
+          Rscript -e '
+            source("scripts/config.R"); source("scripts/coverage.R")
+            url <- use_ppm_source()
+            cat("PPM repo:", url, "\n")
+            cat("R version:", as.character(getRversion()), "\n")
+            cat("UA:", getOption("HTTPUserAgent"), "\n\n")
+            t0 <- Sys.time()
+            install.packages(c("covr","testthat","DBI","RSQLite","callr",
+                               "jsonlite","pkgdepends","remotes"))
+            cat(sprintf("\ntoolchain install: %.0fs\n", as.numeric(Sys.time()-t0, "secs")))
+            need <- c("covr","RSQLite","testthat","callr","jsonlite","pkgdepends")
+            ok <- vapply(need, requireNamespace, logical(1), quietly = TRUE)
+            print(ok)
+            if (!all(ok)) { cat("FAIL: a toolchain package did not load\n"); quit(status = 1) }
+            cat("all toolchain packages load cleanly -- no ABI errors\n")
+          '
+      - name: Run coverage on a probe set via PPM
+        run: |
+          set -euo pipefail
+          Rscript -e '
+            for (s in c("config.R","sources.R","coverage.R","export.R","update.R"))
+              source(file.path("scripts", s))
+            cat("PACKAGE_SOURCE =", PACKAGE_SOURCE, "| PPM_SNAPSHOT =", PPM_SNAPSHOT, "\n\n")
+            # A mix that stresses PPM dependency resolution: dependency-heavy
+            # tidyverse pieces (incl. the cpp11/vctrs stack that broke under
+            # r2u) and a compiled package.
+            probe <- c("glue","cli","scales","stringr","tibble","data.table")
+            db <- available.packages(repos = "https://cloud.r-project.org")
+            cat(sprintf("%-12s %-11s %-8s %-8s %s\n","package","status","line","tests","secs"))
+            for (p in probe) {
+              v <- latest_version(p, db); wd <- tempfile(); dir.create(wd)
+              t0 <- Sys.time()
+              res <- tryCatch(run_unit(p, v, wd), error = function(e) NULL)
+              dt <- as.numeric(Sys.time() - t0, "secs")
+              if (is.null(res)) { cat(sprintf("%-12s ERROR\n", p)); next }
+              s <- res$summary
+              fmt <- function(x) if (is.null(x) || length(x) == 0 || is.na(x)) "-" else format(round(as.numeric(x),1))
+              cat(sprintf("%-12s %-11s %-8s %-8s %.0f\n",
+                          p, s$covr_status[1], fmt(s$line_pct[1]),
+                          fmt(s$coverage_tests_pct[1]), dt))
+            }
+          '
