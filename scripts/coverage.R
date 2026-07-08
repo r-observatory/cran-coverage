@@ -45,6 +45,24 @@ coverage_fingerprint <- function(seed = COVERAGE_SEED) {
   )
 }
 
+#' Point install.packages at a dated Posit PPM Ubuntu-noble binary snapshot so
+#' dependency binaries are built against the running R and cannot drift out of
+#' ABI with it. The HTTPUserAgent header is what makes PPM serve binaries (for
+#' this exact R) rather than source; bspm is turned off so it cannot divert the
+#' install back to the rolling apt repo. Returns the repo URL.
+use_ppm_source <- function(snapshot = PPM_SNAPSHOT) {
+  url <- sprintf("https://packagemanager.posit.co/cran/__linux__/noble/%s", snapshot)
+  options(
+    repos = c(PPM = url),
+    HTTPUserAgent = sprintf(
+      "R/%s R (%s)", getRversion(),
+      paste(getRversion(), R.version$platform, R.version$arch, R.version$os))
+  )
+  options(bspm.MASTER = FALSE)
+  suppressMessages(try(bspm::disable(), silent = TRUE))
+  invisible(url)
+}
+
 .is_compiled_file <- function(filename) {
   grepl("^src/", filename) |
     grepl("\\.(c|cc|cpp|cxx|h|hpp|f|f90|f95)$", filename, ignore.case = TRUE)
@@ -383,14 +401,19 @@ install_sysreqs <- function(pkgdir) {
   source("scripts/config.R")
   source("scripts/sources.R")
   source("scripts/coverage.R")
-  # Install dependencies as r2u apt binaries (bspm). callr does not load the
-  # system profile that normally enables bspm, so without this a compiled
-  # dependency (e.g. systemfonts, ragg) installs from source and fails without
-  # its own system libraries -- which cascades to break its dependents
-  # (textshaping, tidyverse, ...). Binaries pull their runtime libs via apt, so
-  # dependency system requirements are handled without resolving them per-dep.
-  # Best-effort: a no-op where bspm is absent (e.g. the local test suite).
-  suppressMessages(try(bspm::enable(), silent = TRUE))
+  # Install dependency binaries from the configured source. callr does not load
+  # the system profile, so we set the source explicitly here.
+  #  - "r2u" (default): rolling apt binaries via bspm. Enable it here (a no-op
+  #    where bspm is absent, e.g. the local suite). Binaries pull their runtime
+  #    libs via apt, so a compiled dependency (systemfonts, ragg, ...) does not
+  #    fall back to a source build that fails for lack of system libraries.
+  #  - "ppm": a dated PPM noble snapshot whose binaries match the running R, so
+  #    they cannot drift out of ABI with it (the rolling-image failure mode).
+  if (identical(PACKAGE_SOURCE, "ppm")) {
+    use_ppm_source()
+  } else {
+    suppressMessages(try(bspm::enable(), silent = TRUE))
+  }
   apply_determinism()
 
   if (identical(mode, "type_pct")) {
