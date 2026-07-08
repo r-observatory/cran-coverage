@@ -40,7 +40,16 @@ jobs:
             broken <- Filter(function(p) !isTRUE(tryCatch({loadNamespace(p); TRUE},
                              error = function(e) FALSE)), compiled)
             if (length(broken)) {
-              message("rebuilding ABI-mismatched packages from source: ", paste(broken, collapse = " "))
+              # C++ header packages (cpp11, Rcpp, ...) do not fail to load -- they
+              # are header-only, or their .so loads fine -- but their installed
+              # headers can still reference a removed R symbol (SETLENGTH), which
+              # breaks the source rebuild of everything that LinkingTo them.
+              # Refresh those headers first so the dependents can compile.
+              hdr <- intersect(c("cpp11", "Rcpp", "RcppEigen", "RcppArmadillo"),
+                               rownames(installed.packages()))
+              message("rebuilding ABI-mismatched packages from source: ",
+                      paste(unique(c(hdr, broken)), collapse = " "))
+              if (length(hdr)) install.packages(hdr, repos = "https://cloud.r-project.org", type = "source")
               install.packages(broken, repos = "https://cloud.r-project.org", type = "source")
             } else message("compiled stack OK")
           ' || true
