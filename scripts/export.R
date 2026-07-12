@@ -64,12 +64,13 @@ analyzed_versions <- function(con) {
 analyzed_state <- function(con) {
   empty <- data.frame(package = character(0), version = character(0),
                       covr_status = character(0), attempts = integer(0),
-                      stringsAsFactors = FALSE)
+                      fail_reason = character(0), stringsAsFactors = FALSE)
   if (!"coverage_summary" %in% DBI::dbListTables(con)) return(empty)
   cols <- DBI::dbListFields(con, "coverage_summary")
   sel  <- c("package", "version",
             if ("covr_status" %in% cols) "covr_status",
-            if ("attempts" %in% cols) "attempts")
+            if ("attempts" %in% cols) "attempts",
+            if ("fail_reason" %in% cols) "fail_reason")
   df <- DBI::dbGetQuery(con, sprintf("SELECT %s FROM coverage_summary",
                                      paste(sel, collapse = ", ")))
   if (nrow(df) == 0L) return(empty)
@@ -77,7 +78,8 @@ analyzed_state <- function(con) {
   df$attempts <- if (is.null(df$attempts)) 0L else {
     a <- as.integer(df$attempts); a[is.na(a)] <- 0L; a
   }
-  df[c("package", "version", "covr_status", "attempts")]
+  if (is.null(df$fail_reason)) df$fail_reason <- NA_character_
+  df[c("package", "version", "covr_status", "attempts", "fail_reason")]
 }
 
 #' Number of coverage_summary rows in a database file.

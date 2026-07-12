@@ -54,3 +54,41 @@ test_that("run_shard retries a transient failure up to the attempt cap then stop
   expect_equal(max(attempts_seen), MAX_ATTEMPTS)
   expect_equal(tail(attempts_seen, 1L), MAX_ATTEMPTS)   # capped, not still climbing
 })
+
+test_that("select_shard retries a transient 'not available' build_fail past the cap", {
+  universe <- data.frame(package = c("recoverable", "genuine", "done"),
+                         latest_version = "1", stringsAsFactors = FALSE)
+  state <- data.frame(
+    package     = c("recoverable", "genuine", "done"),
+    version     = "1",
+    covr_status = c("build_fail", "build_fail", "ok"),
+    attempts    = c(MAX_ATTEMPTS, MAX_ATTEMPTS, 0L),   # both failures at the cap
+    fail_reason = c("ERROR: dependency 'Rcpp' is not available for package 'recoverable'",
+                    "compilation failed for package 'genuine'", NA_character_),
+    stringsAsFactors = FALSE)
+  sel <- select_shard(universe, state, 10L)
+  expect_true("recoverable" %in% sel)   # transient dep-resolution -> retried past the cap
+  expect_false("genuine" %in% sel)      # genuine compile failure -> stays capped
+  expect_false("done" %in% sel)         # terminal ok -> never
+})
+
+test_that("select_shard still works when state carries no fail_reason column", {
+  universe <- data.frame(package = "capped", latest_version = "1",
+                         stringsAsFactors = FALSE)
+  state <- data.frame(package = "capped", version = "1",
+                      covr_status = "build_fail", attempts = MAX_ATTEMPTS,
+                      stringsAsFactors = FALSE)
+  expect_false("capped" %in% select_shard(universe, state, 10L))  # no reason -> capped
+})
+
+test_that("analyzed_state carries fail_reason", {
+  db <- tempfile(fileext = ".db"); on.exit(unlink(db))
+  con <- open_db(db); on.exit(DBI::dbDisconnect(con), add = TRUE)
+  upsert_coverage(con, data.frame(package = "p", version = "1",
+                                  covr_status = "build_fail",
+                                  fail_reason = "dependency 'x' is not available",
+                                  stringsAsFactors = FALSE), NULL, NULL)
+  st <- analyzed_state(con)
+  expect_true("fail_reason" %in% names(st))
+  expect_match(st$fail_reason[st$package == "p"], "not available")
+})
