@@ -126,3 +126,17 @@ test_that("select_shard retries when the LATEST version's row is a capped-eligib
                       fail_reason = NA_character_, stringsAsFactors = FALSE)
   expect_true("p" %in% select_shard(universe, state, 10L))   # latest=timeout, under cap
 })
+
+test_that("select_shard caps transient 'not available' retries at TRANSIENT_MAX_ATTEMPTS", {
+  # A dependency that lives only on Bioconductor is never in CRAN/PPM, so a
+  # transient retry must not cycle it forever -- it caps at TRANSIENT_MAX.
+  universe <- data.frame(package = "stuck", latest_version = "1",
+                         stringsAsFactors = FALSE)
+  at_cap <- data.frame(package = "stuck", version = "1", covr_status = "build_fail",
+                       attempts = TRANSIENT_MAX_ATTEMPTS,
+                       fail_reason = "dependency 'RBGL' is not available",
+                       stringsAsFactors = FALSE)
+  expect_false("stuck" %in% select_shard(universe, at_cap, 10L))
+  under_cap <- transform(at_cap, attempts = TRANSIENT_MAX_ATTEMPTS - 1L)
+  expect_true("stuck" %in% select_shard(universe, under_cap, 10L))
+})

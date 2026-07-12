@@ -20,6 +20,13 @@ COVR_TYPES        <- c("tests", "examples", "vignettes")
 # test_error, and ok are terminal outcomes and are never re-attempted.
 MAX_ATTEMPTS      <- 3L
 RETRYABLE_STATUS  <- c("build_fail", "covr_error", "timeout")
+# A "dependency not available" build failure is usually transient (a package
+# index blip), so it stays retryable past MAX_ATTEMPTS. But some are permanent
+# (a dependency that lives only on Bioconductor, e.g. RBGL/phyloseq, is never in
+# the CRAN/PPM index), so bound the transient retries too instead of cycling such
+# a package forever. Higher than MAX_ATTEMPTS so genuinely-recoverable packages
+# get the extra tries they need.
+TRANSIENT_MAX_ATTEMPTS <- 6L
 
 # Platform key for resolving a package's SystemRequirements to apt packages.
 # Hardcoded because the collect container is pinned to rocker/r2u:noble
