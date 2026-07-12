@@ -130,7 +130,8 @@ select_shard <- function(universe, state, size, rank = character(0),
   # dependency-resolution failure stays due past the cap (see is_transient_fail)
   # so an index-outage wave does not permanently strand recoverable packages.
   retry   <- !due_new & a_sta %in% RETRYABLE_STATUS &
-             (a_att < MAX_ATTEMPTS | is_transient_fail(a_rsn))
+             (a_att < MAX_ATTEMPTS |
+              (is_transient_fail(a_rsn) & a_att < TRANSIENT_MAX_ATTEMPTS))
   todo    <- due_new | retry
   if (!any(todo)) return(character(0))
 
