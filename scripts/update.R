@@ -55,6 +55,17 @@ subset_partition <- function(src_path, dst_path, index, count) {
 #' Whether a coverage status is a transient failure worth re-attempting.
 is_retryable <- function(status) status %in% RETRYABLE_STATUS
 
+#' A build failure whose cause is transient dependency-resolution trouble (the
+#' package manager reported a dependency "not available") rather than a genuine
+#' build problem. Rolling-repo index outages burned a wave of these into
+#' build_fail at the attempt cap; the dependencies are normally installable, so
+#' such a failure stays retryable past the cap instead of perma-skipping a
+#' package that would build fine once the index recovers (or under a stable
+#' snapshot source).
+is_transient_fail <- function(reason) {
+  !is.na(reason) & grepl("(is|are) not available", reason)
+}
+
 #' Attempt count after recording an outcome: bumped on a retryable failure,
 #' left unchanged on a terminal outcome. NA prior counts as 0.
 next_attempts <- function(prior, status) {
@@ -99,17 +110,24 @@ select_shard <- function(universe, state, size, rank = character(0),
   ver <- stats::setNames(state$version, state$package)
   sta <- stats::setNames(state$covr_status, state$package)
   att <- stats::setNames(state$attempts, state$package)
+  rsn <- if ("fail_reason" %in% names(state))
+           stats::setNames(state$fail_reason, state$package) else
+           stats::setNames(rep(NA_character_, nrow(state)), state$package)
 
   pkg    <- universe$package
   latest <- universe$latest_version
   a_ver  <- ver[pkg]
   a_sta  <- sta[pkg]
   a_att  <- att[pkg]; a_att[is.na(a_att)] <- 0L
+  a_rsn  <- rsn[pkg]
 
   never  <- is.na(a_ver)
   newver <- !never & a_ver != latest
-  retry  <- !never & a_ver == latest &
-            a_sta %in% RETRYABLE_STATUS & a_att < MAX_ATTEMPTS
+  # A retryable failure is due while under the attempt cap; a transient
+  # dependency-resolution failure stays due past the cap (see is_transient_fail)
+  # so an index-outage wave does not permanently strand recoverable packages.
+  retry  <- !never & a_ver == latest & a_sta %in% RETRYABLE_STATUS &
+            (a_att < MAX_ATTEMPTS | is_transient_fail(a_rsn))
   todo   <- never | newver | retry
   if (!any(todo)) return(character(0))
 
