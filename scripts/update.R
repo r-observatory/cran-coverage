@@ -107,32 +107,35 @@ select_shard <- function(universe, state, size, rank = character(0),
   }
   if (nrow(universe) == 0L) return(character(0))
 
-  ver <- stats::setNames(state$version, state$package)
-  sta <- stats::setNames(state$covr_status, state$package)
-  att <- stats::setNames(state$attempts, state$package)
-  rsn <- if ("fail_reason" %in% names(state))
-           stats::setNames(state$fail_reason, state$package) else
-           stats::setNames(rep(NA_character_, nrow(state)), state$package)
+  # Match each package on its LATEST version's row specifically. A package
+  # accumulates one row per version it is measured at; keying on the package
+  # name alone picks whichever row comes first, which is a stale OLD-version row
+  # once CRAN publishes a new version -- and since that old version never equals
+  # the current latest, the package looks perpetually "new-version" and gets
+  # re-selected every iteration even when its latest version is already done,
+  # cycling a handful of popular packages and starving the never-analyzed
+  # backlog. Looking up the (package, latest) row fixes that.
+  sep  <- "\x1f"
+  sidx <- stats::setNames(seq_len(nrow(state)),
+                          paste(state$package, state$version, sep = sep))
+  row  <- sidx[paste(universe$package, universe$latest_version, sep = sep)]
 
-  pkg    <- universe$package
-  latest <- universe$latest_version
-  a_ver  <- ver[pkg]
-  a_sta  <- sta[pkg]
-  a_att  <- att[pkg]; a_att[is.na(a_att)] <- 0L
-  a_rsn  <- rsn[pkg]
+  a_sta <- state$covr_status[row]                     # NA where latest not recorded
+  a_att <- state$attempts[row]; a_att[is.na(a_att)] <- 0L
+  a_rsn <- if ("fail_reason" %in% names(state)) state$fail_reason[row] else
+           rep(NA_character_, length(row))
 
-  never  <- is.na(a_ver)
-  newver <- !never & a_ver != latest
+  due_new <- is.na(row)                               # latest version not measured yet
   # A retryable failure is due while under the attempt cap; a transient
   # dependency-resolution failure stays due past the cap (see is_transient_fail)
   # so an index-outage wave does not permanently strand recoverable packages.
-  retry  <- !never & a_ver == latest & a_sta %in% RETRYABLE_STATUS &
-            (a_att < MAX_ATTEMPTS | is_transient_fail(a_rsn))
-  todo   <- never | newver | retry
+  retry   <- !due_new & a_sta %in% RETRYABLE_STATUS &
+             (a_att < MAX_ATTEMPTS | is_transient_fail(a_rsn))
+  todo    <- due_new | retry
   if (!any(todo)) return(character(0))
 
-  pkg  <- pkg[todo]
-  akey <- ifelse(never[todo] | newver[todo], 0L, a_att[todo])
+  pkg  <- universe$package[todo]
+  akey <- ifelse(due_new[todo], 0L, a_att[todo])
   rk   <- match(pkg, rank); rk[is.na(rk)] <- .Machine$integer.max
   # Order by popularity rank first, so a popular retryable failure is tried at
   # its rank alongside new work (a fix such as sysreqs reaches it soon) rather

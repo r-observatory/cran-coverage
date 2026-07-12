@@ -92,3 +92,37 @@ test_that("analyzed_state carries fail_reason", {
   expect_true("fail_reason" %in% names(st))
   expect_match(st$fail_reason[st$package == "p"], "not available")
 })
+
+test_that("select_shard ignores a stale old-version row when the latest version is done", {
+  # Reproduces the cycling bug: a package with BOTH an old and the latest
+  # version recorded must not be re-selected when the latest version is terminal.
+  universe <- data.frame(package = "coin", latest_version = "1.4-5",
+                         stringsAsFactors = FALSE)
+  state <- data.frame(
+    package     = c("coin", "coin"),
+    version     = c("1.4-4", "1.4-5"),   # stale old row first, latest second
+    covr_status = c("ok", "ok"),
+    attempts    = c(0L, 0L),
+    fail_reason = NA_character_,
+    stringsAsFactors = FALSE)
+  expect_false("coin" %in% select_shard(universe, state, 10L))
+})
+
+test_that("select_shard still selects a package whose latest version is not yet recorded", {
+  universe <- data.frame(package = "coin", latest_version = "1.4-5",
+                         stringsAsFactors = FALSE)
+  # only the OLD version is recorded -> the latest is still due
+  state <- data.frame(package = "coin", version = "1.4-4", covr_status = "ok",
+                      attempts = 0L, fail_reason = NA_character_,
+                      stringsAsFactors = FALSE)
+  expect_true("coin" %in% select_shard(universe, state, 10L))
+})
+
+test_that("select_shard retries when the LATEST version's row is a capped-eligible failure", {
+  universe <- data.frame(package = "p", latest_version = "2",
+                         stringsAsFactors = FALSE)
+  state <- data.frame(package = c("p", "p"), version = c("1", "2"),
+                      covr_status = c("ok", "timeout"), attempts = c(0L, 1L),
+                      fail_reason = NA_character_, stringsAsFactors = FALSE)
+  expect_true("p" %in% select_shard(universe, state, 10L))   # latest=timeout, under cap
+})
