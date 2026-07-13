@@ -35,3 +35,7 @@ inside `rocker/r2u:noble`, publishing the database and the raw-object
 tarballs to this repository's rolling `current` release after each shard.
 
 `Rscript tests/testthat.R` runs the unit test suite.
+
+## Feedback
+
+Found a bug, a wrong number, or a missing package? Report it at [r-observatory/feedback](https://github.com/r-observatory/feedback/issues/new/choose). All feedback about R Observatory, the site, the data, and the pipelines, is tracked in one place.
