@@ -343,8 +343,21 @@ jobs:
               "Assets: `cran-coverage.db` (SQLite) and `manifest.json`. Raw covr objects and per-runner shard state live on the `internal` prerelease."
             )
             writeLines(notes, "notes.md")
-            man <- list(processed = total, remaining = if (is.na(remaining)) NA else remaining)
-            writeLines(jsonlite::toJSON(man, auto_unbox = TRUE), "manifest.json")
+            man <- list(processed = total,
+                        remaining = if (is.na(remaining)) NA else remaining,
+                        generated_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"))
+            # Integrity/completeness core for the canonical published database
+            # asset (cran-coverage.db). Prefer the fresh copy the merge step
+            # published this run; if that step refused to publish (fewer rows
+            # than the prior canonical), the prior canonical downloaded to
+            # prior/cran-coverage.db remains the published asset. Both paths
+            # have basename cran-coverage.db, so db_filename is always correct.
+            db_pub <- if (file.exists("cran-coverage.db")) "cran-coverage.db" else
+                      if (file.exists("prior/cran-coverage.db")) "prior/cran-coverage.db" else NA_character_
+            if (!is.na(db_pub)) {
+              man <- c(man, summary_integrity_core(db_pub, complete = coverage_complete(remaining)))
+            }
+            writeLines(jsonlite::toJSON(man, auto_unbox = TRUE, pretty = TRUE), "manifest.json")
           ' || { echo "collection summary generation failed; leaving release notes unchanged"; exit 0; }
           gh release edit "$PUBLIC_TAG" --notes-file notes.md || true
           if [ -f manifest.json ]; then gh release upload "$PUBLIC_TAG" manifest.json --clobber || true; fi
