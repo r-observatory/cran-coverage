@@ -55,6 +55,48 @@ test_that("run_shard retries a transient failure up to the attempt cap then stop
   expect_equal(tail(attempts_seen, 1L), MAX_ATTEMPTS)   # capped, not still climbing
 })
 
+test_that("run_shard counts attempts on the LATEST version, not an old-version row", {
+  # Regression for the attempts-inheritance bug: a package with an old
+  # terminal row already recorded, whose latest version keeps failing. The
+  # attempt counter must be read from the (package, latest-version) row so it
+  # climbs 1,2,...,MAX_ATTEMPTS and then the package is retired. Keying the
+  # prior-attempts lookup on the package NAME reads the old row's attempts (0)
+  # every pass, freezing the new version's counter at 1 so it never caps and
+  # the shard loop re-runs it forever.
+  db_dir <- tempfile("newver_"); dir.create(db_dir)
+  # Seed an old-version terminal row (ok, attempts 0), as if a prior run
+  # measured version 1 before CRAN published version 2.
+  con <- open_db(file.path(db_dir, DB_FILENAME))
+  upsert_coverage(con, data.frame(package = "p", version = "1",
+                                  covr_status = "ok", attempts = 0L,
+                                  fail_reason = NA_character_,
+                                  stringsAsFactors = FALSE), NULL, NULL)
+  DBI::dbDisconnect(con)
+
+  io <- list(
+    package_list = function() data.frame(package = "p", latest_version = "2",
+                                         stringsAsFactors = FALSE),
+    run = function(package, version, workdir) list(
+      summary = data.frame(package = package, version = version,
+                           line_pct = NA_real_, covr_status = "build_fail",
+                           fail_reason = "compilation failed for package 'p'",
+                           stringsAsFactors = FALSE),
+      file = NULL, func = NULL, raw = NULL)
+  )
+  attempts_seen <- integer(0)
+  for (i in seq_len(MAX_ATTEMPTS + 2L)) {
+    suppressMessages(run_shard(io, db_dir, shard_size = 10L))
+    con <- open_db(file.path(db_dir, DB_FILENAME))
+    a <- DBI::dbGetQuery(con,
+      "SELECT attempts FROM coverage_summary WHERE package='p' AND version='2'")$attempts
+    DBI::dbDisconnect(con)
+    attempts_seen <- c(attempts_seen, if (length(a)) a else 0L)
+  }
+  # The version-2 row climbs to the cap and then the package stops being run.
+  expect_equal(max(attempts_seen), MAX_ATTEMPTS)
+  expect_equal(tail(attempts_seen, 1L), MAX_ATTEMPTS)
+})
+
 test_that("select_shard retries a transient 'not available' build_fail past the cap", {
   universe <- data.frame(package = c("recoverable", "genuine", "done"),
                          latest_version = "1", stringsAsFactors = FALSE)
