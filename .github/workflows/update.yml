@@ -44,24 +44,39 @@ jobs:
     steps:
       - name: Ensure the public and internal releases exist
         run: |
-          set -euo pipefail
-          if gh release view "$PUBLIC_TAG" >/dev/null 2>&1; then
-            echo "public release '$PUBLIC_TAG' already exists"
-          else
-            echo "creating public release '$PUBLIC_TAG'"
-            gh release create "$PUBLIC_TAG" --target "$GITHUB_SHA" \
-              --title "CRAN Coverage (rolling)" \
-              --notes "Latest-version test coverage for CRAN packages." --latest
-          fi
-          if gh release view "$INTERNAL_TAG" >/dev/null 2>&1; then
-            echo "internal release '$INTERNAL_TAG' already exists"
-          else
-            echo "creating internal prerelease '$INTERNAL_TAG'"
-            gh release create "$INTERNAL_TAG" --target "$GITHUB_SHA" \
-              --title "CRAN Coverage (internal state)" \
-              --notes "Per-runner shard databases and raw covr objects. Pipeline internals; not for direct use. Consumers should read cran-coverage.db on the 'current' release." \
-              --prerelease
-          fi
+          set -uo pipefail
+          # `gh release view` exits non-zero for BOTH "release absent" (404) and
+          # any transient API error (403 rate limit, 5xx). The old
+          # `if gh release view >/dev/null 2>&1` conflated them: on a 403 it took
+          # the else branch and ran `gh release create` on a release that already
+          # exists, whose own 403 then failed the whole run. The 403 tail of the
+          # previous scheduled run's upload burst is exactly when this fires.
+          # Branch on the HTTP status instead -- only a real 404 creates -- and
+          # back off and retry a transient status so a drained per-repo API
+          # budget does not fail bootstrap.
+          ensure_release() {
+            tag="$1"; shift
+            for attempt in 1 2 3 4 5 6; do
+              status=$(gh api -i "repos/${GH_REPO}/releases/tags/${tag}" 2>/dev/null | awk 'NR==1{print $2}')
+              case "${status:-none}" in
+                200) echo "release '${tag}' already exists"; return 0 ;;
+                404) echo "creating release '${tag}'"
+                     if gh release create "$tag" "$@"; then return 0; fi
+                     echo "create failed for '${tag}'; re-checking" ;;
+                *)   echo "transient status '${status:-none}' for '${tag}' (attempt ${attempt}); backing off" ;;
+              esac
+              if [ "$attempt" -lt 6 ]; then sleep $((attempt * 60)); fi
+            done
+            echo "could not confirm release '${tag}' exists after retries" >&2
+            return 1
+          }
+          ensure_release "$PUBLIC_TAG" --target "$GITHUB_SHA" \
+            --title "CRAN Coverage (rolling)" \
+            --notes "Latest-version test coverage for CRAN packages." --latest || exit 1
+          ensure_release "$INTERNAL_TAG" --target "$GITHUB_SHA" \
+            --title "CRAN Coverage (internal state)" \
+            --notes "Per-runner shard databases and raw covr objects. Pipeline internals; not for direct use. Consumers should read cran-coverage.db on the 'current' release." \
+            --prerelease || exit 1
 
   collect:
     needs: bootstrap
@@ -174,15 +189,19 @@ jobs:
           SHARD_ASSET="cran-coverage-shard-${SHARD_INDEX}.db"
           PRIOR_ROWS=$(cat out/.prior_rows 2>/dev/null || echo 0)
           echo "partition ${SHARD_INDEX}/${SHARD_COUNT} | budget ${BUDGET}s | starting from ${PRIOR_ROWS} banked rows"
-          # Publish this runner's shard DB and raw tarballs to the INTERNAL
-          # prerelease after every shard (including a failed one), so partial
-          # per-package progress is never lost. Only this runner ever writes
-          # cran-coverage-shard-<i>.db / covr-raw-s<i>-*, so there is no
-          # cross-runner clobber; the merge job folds the shard databases into
-          # the public canonical cran-coverage.db. The row-count guard refuses
-          # to publish a DB smaller than the one we started from, so a corrupted
-          # or truncated local DB can never overwrite banked coverage.
-          publish() {
+          # Publish this runner's shard DB to the INTERNAL prerelease after every
+          # shard (including a failed one), so partial per-package progress is
+          # never lost. Only this runner ever writes cran-coverage-shard-<i>.db,
+          # so there is no cross-runner clobber; the merge job folds the shard
+          # databases into the public canonical cran-coverage.db. The row-count
+          # guard refuses to publish a DB smaller than the one we started from,
+          # so a corrupted or truncated local DB can never overwrite banked
+          # coverage. The raw covr tarballs are NOT uploaded here: they are large
+          # and unchanged between iterations, and re-tarring plus re-uploading
+          # ~27 partition assets every loop drained the per-repo API budget
+          # (1,000 REST calls/hour) in minutes. They are bundled and uploaded
+          # once, after the loop, by the block below.
+          publish_db() {
             if [ -f out/cran-coverage.db ]; then
               NEW_ROWS=$(Rscript -e 'source("scripts/export.R"); cat(summary_row_count("out/cran-coverage.db"))' 2>/dev/null || echo 0)
               if [ "$NEW_ROWS" -gt 0 ] && [ "$NEW_ROWS" -ge "$PRIOR_ROWS" ]; then
@@ -194,19 +213,36 @@ jobs:
                 echo "refusing to publish shard DB: new rows ($NEW_ROWS) < prior rows ($PRIOR_ROWS); keeping the released shard"
               fi
             fi
-            Rscript -e 'source("scripts/export.R"); bundle_partitions("out/raw", "out/bundle", prefix = paste0("covr-raw-s", Sys.getenv("SHARD_INDEX"), "-"))' || true
-            for f in out/bundle/covr-raw-s"${SHARD_INDEX}"-*.tar.gz; do
-              if [ -f "$f" ]; then gh release upload "$INTERNAL_TAG" "$f" --clobber || true; fi
-            done
           }
           fails=0
+          # No-progress circuit breaker. `remaining` (never-done + under-cap
+          # retryable units in this partition) must fall as shards complete. If
+          # it does not decrease for NOPROGRESS_LIMIT consecutive shards, the
+          # selection is stuck re-running the same units instead of advancing;
+          # stop and let the next scheduled run resume rather than burning the
+          # whole budget (and API) spinning. A generous limit so a legitimately
+          # slow drain never trips it -- it only catches a genuine stall.
+          NOPROGRESS_LIMIT=8
+          noprogress=0
+          prev_remain=""
           while :; do
             echo "=== shard ${SHARD_INDEX} (elapsed ${SECONDS}s) ==="
             if Rscript scripts/update.R out/; then
               fails=0
-              publish
+              publish_db
               REMAIN=$(jq -r '.remaining' out/manifest.json 2>/dev/null || echo 1)
-              if [ "$REMAIN" = "0" ]; then break; fi
+              case "$REMAIN" in ''|*[!0-9]*) REMAIN=1 ;; esac
+              if [ "$REMAIN" -eq 0 ]; then break; fi
+              if [ -n "$prev_remain" ] && [ "$REMAIN" -ge "$prev_remain" ]; then
+                noprogress=$((noprogress + 1))
+                if [ "$noprogress" -ge "$NOPROGRESS_LIMIT" ]; then
+                  echo "remaining stuck at ${REMAIN} for ${noprogress} shards; stopping this run, banked coverage is safe and the next scheduled run resumes"
+                  break
+                fi
+              else
+                noprogress=0
+              fi
+              prev_remain="$REMAIN"
             else
               # A shard runner can die when installing a package's dependencies via
               # apt/bspm replaces a loaded shared object (rlang.so and the like) mid
@@ -216,13 +252,21 @@ jobs:
               # cleanly and let the next scheduled run resume from a fresh container.
               fails=$((fails + 1))
               echo "shard runner exited non-zero (attempt ${fails}); publishing partial progress and retrying in a fresh process"
-              publish
+              publish_db
               if [ "$fails" -ge 2 ]; then
                 echo "repeated shard failure; stopping this run, banked coverage is safe and the next scheduled run starts fresh"
                 break
               fi
             fi
             if [ "$SECONDS" -ge "$BUDGET" ]; then break; fi
+          done
+          # Bundle and upload this runner's raw covr objects ONCE, after the loop.
+          # Moving this out of the per-iteration publish is the single largest cut
+          # to API usage. Best-effort: the shard DB above already banked the
+          # coverage numbers, so never fail the run over the secondary raw store.
+          Rscript -e 'source("scripts/export.R"); bundle_partitions("out/raw", "out/bundle", prefix = paste0("covr-raw-s", Sys.getenv("SHARD_INDEX"), "-"))' || true
+          for f in out/bundle/covr-raw-s"${SHARD_INDEX}"-*.tar.gz; do
+            if [ -f "$f" ]; then gh release upload "$INTERNAL_TAG" "$f" --clobber || true; fi
           done
 
   # Fold the per-runner shard databases (from the internal prerelease) into the
@@ -264,39 +308,90 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p shards
+          # Distinguish "no shards exist yet" (fresh pipeline -> nothing to merge,
+          # exit 0) from "shards exist but the download dropped some" (a transient
+          # API error -> FATAL: proceeding would merge a partial set and the
+          # PRIOR floor below could then let a shards-only, smaller DB clobber the
+          # canonical). Count what actually exists on the internal release first.
+          EXPECTED=$(gh release view "$INTERNAL_TAG" --json assets \
+            -q '[.assets[].name | select(test("^cran-coverage-shard-.*\\.db$"))] | length')
+          if [ -z "$EXPECTED" ]; then
+            echo "could not list internal release assets (transient API error); aborting without publishing" >&2
+            exit 1
+          fi
+          if [ "$EXPECTED" -eq 0 ]; then echo "no shard databases exist yet; nothing to merge"; exit 0; fi
           gh release download "$INTERNAL_TAG" --pattern 'cran-coverage-shard-*.db' --dir shards || true
           shopt -s nullglob
           files=(shards/cran-coverage-shard-*.db)
-          if [ ${#files[@]} -eq 0 ]; then echo "no shard databases to merge yet"; exit 0; fi
+          if [ "${#files[@]}" -lt "$EXPECTED" ]; then
+            echo "downloaded ${#files[@]} of ${EXPECTED} shard database(s) (partial fetch); aborting so a partial merge cannot clobber the canonical" >&2
+            exit 1
+          fi
           echo "merging ${#files[@]} shard database(s): ${files[*]}"
           # Start the merge FROM the current canonical (monotonic merge): the
           # shards are upserted onto it, so a failed or stale shard can never
           # drop rows or freeze recoveries -- only the packages a shard actually
           # carries are updated, the rest are preserved. PRIOR is the guard
-          # floor: never publish fewer rows than the canonical already has.
-          PRIOR=0
-          if gh release view "$PUBLIC_TAG" --json assets -q '.assets[].name' | grep -qx cran-coverage.db; then
-            gh release download "$PUBLIC_TAG" --pattern cran-coverage.db --dir prior || true
-            PRIOR=$(Rscript -e 'source("scripts/export.R"); cat(summary_row_count("prior/cran-coverage.db"))' 2>/dev/null || echo 0)
-            if [ -f prior/cran-coverage.db ] && [ "$PRIOR" -gt 0 ]; then
-              cp -f prior/cran-coverage.db out-cran-coverage.db
-            fi
+          # floor: never publish fewer rows than the canonical already has. A
+          # failed public-release read or a failed canonical download is FATAL,
+          # not PRIOR=0: PRIOR=0 vacates the floor below and would let a partial
+          # merge clobber the published database. PRIOR=0 is legitimate only when
+          # the public release genuinely holds no canonical yet.
+          if ! PUB_ASSETS=$(gh release view "$PUBLIC_TAG" --json assets -q '.assets[].name'); then
+            echo "could not list public release assets (transient API error); aborting" >&2
+            exit 1
           fi
-          MERGED=$(Rscript -e '
+          PRIOR=0
+          if echo "$PUB_ASSETS" | grep -qx cran-coverage.db; then
+            if ! gh release download "$PUBLIC_TAG" --pattern cran-coverage.db --dir prior; then
+              echo "canonical exists but could not be downloaded (transient API error); aborting" >&2
+              exit 1
+            fi
+            PRIOR=$(Rscript -e 'source("scripts/export.R"); cat(summary_row_count("prior/cran-coverage.db"))' 2>/dev/null || echo 0)
+            if [ ! -f prior/cran-coverage.db ] || [ "$PRIOR" -le 0 ]; then
+              echo "canonical downloaded empty/unreadable; aborting rather than seeding an empty merge base" >&2
+              exit 1
+            fi
+            cp -f prior/cran-coverage.db out-cran-coverage.db
+          fi
+          # A crash in merge_shards (e.g. a fully-downloaded but corrupt or
+          # schema-mismatched shard) exits the Rscript non-zero with no stdout.
+          # Under `set -uo pipefail` (no -e) an unguarded `MERGED=$(...)` would
+          # then be empty and fall into the low-row skip below, exiting 0 green
+          # and freezing the canonical -- the same silent-green failure F5
+          # eliminates elsewhere. Make the crash and any non-numeric output fatal.
+          if ! MERGED=$(Rscript -e '
             source("scripts/export.R")
             shards <- list.files("shards", pattern = "^cran-coverage-shard-.*\\.db$", full.names = TRUE)
             n <- merge_shards(shards, "out-cran-coverage.db")
             cat(n)
-          ')
+          '); then
+            echo "merge computation failed (merge_shards errored, likely a corrupt shard); aborting so the canonical is not silently frozen" >&2
+            exit 1
+          fi
+          case "$MERGED" in
+            ''|*[!0-9]*)
+              echo "merge produced no numeric row count ('${MERGED}'); aborting rather than silently freezing the canonical" >&2
+              exit 1 ;;
+          esac
           echo "merged rows: ${MERGED} (prior canonical: ${PRIOR})"
-          if [ -z "$MERGED" ] || [ "$MERGED" -le 0 ] || [ "$MERGED" -lt "$PRIOR" ]; then
+          # Legitimate non-fatal skip: the merge SUCCEEDED but produced fewer rows
+          # than the canonical already holds (a stale/regressed shard set).
+          # Monotonic merge makes this unlikely, but if it happens keep the
+          # published canonical rather than shrinking it; the next run re-merges.
+          if [ "$MERGED" -le 0 ] || [ "$MERGED" -lt "$PRIOR" ]; then
             echo "refusing to publish merged DB (${MERGED} rows) over the prior canonical (${PRIOR} rows)"
             exit 0
           fi
           # gh's file#name is a display label, not a rename, so copy to the
-          # target filename first.
+          # target filename first. A failed publish is FATAL (surfaces as a red
+          # run) rather than a silent green no-op: the shards are safe and the
+          # next run retries, but a persistently frozen canonical must be visible.
           cp -f out-cran-coverage.db cran-coverage.db
-          gh release upload "$PUBLIC_TAG" cran-coverage.db --clobber || true
+          if ! gh release upload "$PUBLIC_TAG" cran-coverage.db --clobber; then
+            echo "failed to upload the merged canonical (transient API error); shards are safe, the next run retries" >&2
+            exit 1
+          fi
       - name: Publish collection summary
         if: always()
         run: |
