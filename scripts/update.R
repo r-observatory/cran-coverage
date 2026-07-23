@@ -154,7 +154,14 @@ run_shard <- function(io, out_dir, shard_size = SHARD_SIZE,
 
   universe  <- io$package_list()
   state     <- analyzed_state(con)
-  prior_att <- stats::setNames(state$attempts, state$package)
+  # Key prior attempts on (package, version), not the package name alone. A
+  # package accumulates one row per measured version, and the new-version row
+  # is appended after the old one; looking up by name returns the FIRST (old)
+  # row, so a still-failing new version reads the old row's attempts every pass
+  # and its counter freezes -- it never reaches the cap and the loop re-runs it
+  # forever. Match the same (package, version) key select_shard uses.
+  prior_att <- stats::setNames(state$attempts,
+                               paste(state$package, state$version, sep = "\x1f"))
   shard     <- select_shard(universe, state, shard_size, rank = rank, slice = slice)
 
   n <- length(shard)
@@ -174,7 +181,8 @@ run_shard <- function(io, out_dir, shard_size = SHARD_SIZE,
         covr_status = "covr_error", line_pct = NA_real_,
         fail_reason = conditionMessage(e), stringsAsFactors = FALSE),
         file = NULL, func = NULL, raw = NULL))
-    pa <- unname(prior_att[pkg]); if (length(pa) == 0L || is.na(pa)) pa <- 0L
+    pa <- unname(prior_att[paste(pkg, v, sep = "\x1f")])
+    if (length(pa) == 0L || is.na(pa)) pa <- 0L
     res$summary$attempts <- next_attempts(pa, res$summary$covr_status[1])
     upsert_coverage(con, res$summary, res$file, res$func)
     if (!is.null(res$raw)) write_raw_object(raw_dir, pkg, v, res$raw)
