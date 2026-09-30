@@ -28,6 +28,14 @@ RETRYABLE_STATUS  <- c("build_fail", "covr_error", "timeout")
 # get the extra tries they need.
 TRANSIENT_MAX_ATTEMPTS <- 6L
 
+# Rows of data/requeue/requeue.tsv each collect leg re-measures per run, ahead
+# of normal work. At ~85s a row, 30 add ~45 minutes to a leg, whose normal
+# work usually takes under 30 of its 300 budgeted minutes.
+REQUEUE_PER_RUN <- 30L
+# Failed re-measures of one queued row before it is no longer tried. Kept apart
+# from the attempts column, which a re-measure never changes.
+REQUEUE_MAX_ATTEMPTS <- 3L
+
 # Platform key for resolving a package's SystemRequirements to apt packages.
 # Hardcoded because the collect container is pinned to rocker/r2u:noble
 # (Ubuntu 24.04); revisit if the base image changes.

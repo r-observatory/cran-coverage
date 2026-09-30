@@ -161,6 +161,118 @@ upsert_coverage <- function(con, summary_df, file_df, func_df) {
   invisible(TRUE)
 }
 
+#' Replace every stored row of one package version with a new measurement.
+#'
+#' Unlike upsert_coverage, file and function rows the new measurement lacks
+#' are removed too. Runs in one transaction, so a failed write keeps the old
+#' rows.
+#'
+#' @param con,summary_df,file_df,func_df As in upsert_coverage; summary_df
+#'   holds exactly one row.
+#' @return invisible(TRUE)
+replace_coverage <- function(con, summary_df, file_df, func_df) {
+  stopifnot(nrow(summary_df) == 1L)
+  DBI::dbWithTransaction(con, {
+    for (tbl in c("coverage_file", "coverage_function")) {
+      DBI::dbExecute(con, sprintf("DELETE FROM %s WHERE package=? AND version=?", tbl),
+                     params = list(summary_df$package, summary_df$version))
+    }
+    upsert_coverage(con, summary_df, file_df, func_df)
+  })
+  invisible(TRUE)
+}
+
+# Queued re-measurements (data/requeue/requeue.tsv) are logged in the shard
+# database: one requeue_log row per attempt and one requeue_runs row of counts
+# per run. The merge copies neither into the canonical database.
+
+#' Every queued re-measurement attempt recorded in this database.
+#' @return data.frame(run_id, package, version, covr_status, measured).
+requeue_log <- function(con) {
+  if (!"requeue_log" %in% DBI::dbListTables(con)) {
+    return(data.frame(run_id = character(0), package = character(0),
+                      version = character(0), covr_status = character(0),
+                      measured = integer(0), stringsAsFactors = FALSE))
+  }
+  d <- DBI::dbGetQuery(con, "SELECT run_id, package, version, covr_status, measured
+                             FROM requeue_log")
+  d$measured <- as.integer(d$measured)
+  d
+}
+
+#' Record one queued re-measurement attempt.
+#' @param measured TRUE when it replaced the stored rows and wrote a raw object.
+log_requeue <- function(con, run_id, package, version, status, measured,
+                        reason = NA_character_) {
+  DBI::dbExecute(con, "CREATE TABLE IF NOT EXISTS requeue_log (
+    run_id TEXT, package TEXT, version TEXT, covr_status TEXT,
+    measured INTEGER, fail_reason TEXT, logged_at TEXT)")
+  DBI::dbAppendTable(con, "requeue_log", data.frame(
+    run_id = run_id, package = package, version = version, covr_status = status,
+    measured = as.integer(measured), fail_reason = as.character(reason),
+    logged_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    stringsAsFactors = FALSE))
+  invisible(TRUE)
+}
+
+REQUEUE_COUNTS <- c("queued", "measured", "failed", "left", "capped")
+
+#' Per-run queue counts recorded in this database, oldest first.
+requeue_runs <- function(con) {
+  if (!"requeue_runs" %in% DBI::dbListTables(con)) return(NULL)
+  DBI::dbGetQuery(con, sprintf("SELECT run_id, %s FROM requeue_runs ORDER BY rowid",
+                               paste(REQUEUE_COUNTS, collapse = ", ")))
+}
+
+#' Store (or replace) one run's queue counts.
+#' @param counts list(queued, measured, failed, left, capped).
+record_requeue_run <- function(con, run_id, counts) {
+  DBI::dbExecute(con, "CREATE TABLE IF NOT EXISTS requeue_runs (
+    run_id TEXT, queued INTEGER, measured INTEGER, failed INTEGER,
+    left INTEGER, capped INTEGER, updated_at TEXT)")
+  DBI::dbWithTransaction(con, {
+    DBI::dbExecute(con, "DELETE FROM requeue_runs WHERE run_id=?", params = list(run_id))
+    DBI::dbAppendTable(con, "requeue_runs", data.frame(
+      run_id = run_id, as.data.frame(lapply(counts[REQUEUE_COUNTS], as.integer)),
+      updated_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+      stringsAsFactors = FALSE))
+  })
+  invisible(TRUE)
+}
+
+#' Queue counts for one run, summed over the shard databases.
+#'
+#' A shard with no row for the run did no queued work in it; its latest row
+#' supplies what is still left there.
+#'
+#' @param shard_paths Shard database files; missing or unreadable ones are skipped.
+#' @param run_id      The run to report.
+#' @return list(queued, measured, failed, left, capped), or NULL when no
+#'   shard has recorded any.
+requeue_totals <- function(shard_paths, run_id) {
+  read_runs <- function(p) {
+    con <- DBI::dbConnect(RSQLite::SQLite(), p)
+    on.exit(DBI::dbDisconnect(con))
+    requeue_runs(con)
+  }
+  tot <- NULL
+  for (p in shard_paths) {
+    if (!file.exists(p)) next
+    runs <- tryCatch(read_runs(p), error = function(e) NULL)
+    if (is.null(runs) || nrow(runs) == 0L) next
+    r <- if (run_id %in% runs$run_id) runs[runs$run_id == run_id, ][1, ] else {
+      last <- runs[nrow(runs), ]
+      last$queued <- last$left
+      last$measured <- 0L
+      last$failed <- 0L
+      last
+    }
+    add <- lapply(r[REQUEUE_COUNTS], as.integer)
+    tot <- if (is.null(tot)) add else Map(`+`, tot, add)
+  }
+  tot
+}
+
 # Raw covr object store: the serialized covr coverage object for each
 # package/version is kept on disk, partitioned by package first letter, and
 # bundled into per-partition tarballs for release publishing.
@@ -194,6 +306,21 @@ write_raw_object <- function(dir, package, version, raw) {
   dir.create(part, showWarnings = FALSE, recursive = TRUE)
   saveRDS(raw, file.path(part, sprintf("%s_%s.rds", package, version)),
           compress = "xz")
+}
+
+#' Where write_raw_object() puts each package version's raw covr object.
+raw_object_path <- function(dir, package, version) {
+  file.path(dir, vapply(package, raw_partition, "", USE.NAMES = FALSE),
+            sprintf("%s_%s.rds", package, version))
+}
+
+#' The release bundle each package's raw covr object belongs in: the shard's
+#' covr-raw-s<i>-<partition>.tar.gz, or covr-raw-<partition>.tar.gz unsharded.
+raw_bundle_for <- function(package, slice = NULL) {
+  prefix <- if (is.null(slice)) "covr-raw-" else
+    sprintf("covr-raw-s%d-", as.integer(slice$index))
+  sprintf("%s%s.tar.gz", prefix,
+          vapply(package, raw_partition, "", USE.NAMES = FALSE))
 }
 
 #' Tar each partition directory into its own covr-raw-<partition>.tar.gz,

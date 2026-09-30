@@ -34,6 +34,17 @@ raw covr objects under `out/raw/`. GitHub Actions runs shards on a schedule
 inside `rocker/r2u:noble`, publishing the database and the raw-object
 tarballs to this repository's rolling `current` release after each shard.
 
+`data/requeue/requeue.tsv` lists package versions to measure again (package,
+version, reason). Each collect leg measures up to `REQUEUE_PER_RUN` of them
+per run, before its normal work, while the listed version is still the
+current CRAN version and its raw covr object is missing from the shard's
+bundle. A re-measure that succeeds replaces the stored rows and adds the
+object to the bundle. One that fails leaves the stored rows as they were, and
+the row is tried again on a later run, up to `REQUEUE_MAX_ATTEMPTS` failures.
+A row drops out once its object is in the bundle, so the file needs no
+editing. The run summary and `manifest.json` report how many rows were
+queued, measured, failed and left.
+
 `Rscript tests/testthat.R` runs the unit test suite.
 
 ## Feedback
