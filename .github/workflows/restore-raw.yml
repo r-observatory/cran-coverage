@@ -1,0 +1,57 @@
+name: Restore raw covr objects
+# One-off: puts the raw covr objects listed in data/restore/restore-manifest.tsv
+# back into the covr-raw-s<i>-a.tar.gz bundles on the internal release, from the
+# pre-shard covr-raw-a.tar.gz (which it never deletes). Each bundle goes up under
+# a temporary name, then replaces the old one. See scripts/restore.R.
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: "Shards whose -a bundle to restore, space separated."
+        default: "0 1 2 3"
+      dry_run:
+        description: "Build and check the bundles without changing the release."
+        type: boolean
+        default: false
+concurrency:
+  # Same group as the update workflow, so the two never write the release at once.
+  # A dispatch left waiting is dropped if an update tick queues after it.
+  group: cran-coverage-update
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    # The collect job's image, so the bundles are rebuilt with the same R.
+    container: rocker/r2u:noble@sha256:816279dd028627eef4c06416a25fb47f8943bab5f505f81510db55d5386667c5
+    timeout-minutes: 60
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      INTERNAL_TAG: internal
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install gh
+        run: |
+          set -euo pipefail
+          apt-get update -qq || true
+          apt-get install -y --no-install-recommends gh
+      - name: Restore the -a bundles
+        env:
+          RESTORE_SHARDS: ${{ inputs.shards }}
+          RESTORE_DRY_RUN: ${{ inputs.dry_run }}
+        run: Rscript scripts/restore.R
+      - name: Keep rebuilt bundles whose swap did not finish
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: covr-raw-restore-unsent-attempt-${{ github.run_attempt }}
+          path: out/unsent/
+          if-no-files-found: ignore
+          retention-days: 90
