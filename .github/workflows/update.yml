@@ -270,8 +270,9 @@ jobs:
             if [ "$SECONDS" -ge "$BUDGET" ]; then break; fi
           done
           # Bundle and upload raw covr objects once, after the loop (API budget).
-          # A bundle whose prior copy was not fetched whole, or that would drop
-          # objects, is held back; that or a failed upload fails the leg last.
+          # An unchanged bundle is skipped. One whose prior copy was not fetched
+          # whole, or that would drop objects, is held back; that or a failed
+          # upload fails the leg last.
           rm -f out/bundle/upload.txt out/bundle/held.txt
           Rscript -e '
             for (s in c("config.R", "export.R", "update.R")) source(file.path("scripts", s))
@@ -280,20 +281,26 @@ jobs:
                                        paste0("covr-raw-s", idx, "-"), as.integer(idx),
                                        as.integer(Sys.getenv("SHARD_COUNT")),
                                        gh_release_downloader(Sys.getenv("INTERNAL_TAG")))
-            up <- plan[["upload"]]; nm <- plan[["name"]]; why <- plan[["reason"]]
-            for (i in which(!up)) cat(sprintf("::warning::holding back %s: %s\n", nm[i], why[i]))
-            writeLines(nm[!up], "out/bundle/held.txt")
+            up <- plan[["upload"]]; held <- plan[["held"]]; nm <- plan[["name"]]
+            for (i in which(held)) cat(sprintf("::warning::holding back %s: %s\n", nm[i], plan[["reason"]][i]))
+            cat(sprintf("raw bundles: %d to upload, %d unchanged, %d held back\n",
+                        sum(up), sum(!up & !held), sum(held)))
+            writeLines(nm[held], "out/bundle/held.txt")
             writeLines(nm[up], "out/bundle/upload.txt")
           ' || echo "::warning::raw bundle planning failed for shard ${SHARD_INDEX}; no raw bundle uploaded this run"
           raw_failed=0
+          mkdir -p out/unsent
           if [ -f out/bundle/upload.txt ]; then
             # Read the list on fd 3 so gh cannot consume it from stdin.
             while IFS= read -r name <&3; do
               [ -n "$name" ] || continue
-              # gh deletes the old asset first, so retry rather than leave it gone.
+              # gh deletes the old asset before uploading, so a failed upload can
+              # leave the release without it. The bundle waits in out/unsent until
+              # it is up; a failed leg keeps what is left there as an artifact.
+              mv "out/bundle/$name" "out/unsent/$name"
               for attempt in 1 2 3; do
-                if gh release upload "$INTERNAL_TAG" "out/bundle/$name" --clobber; then break; fi
-                if [ "$attempt" -eq 3 ]; then echo "::warning::upload of ${name} failed"; raw_failed=1; else sleep $((attempt * 30)); fi
+                if gh release upload "$INTERNAL_TAG" "out/unsent/$name" --clobber; then rm -f "out/unsent/$name"; break; fi
+                if [ "$attempt" -eq 3 ]; then echo "::warning::upload of ${name} failed; the bundle is kept as a workflow artifact"; raw_failed=1; else sleep $((attempt * 30)); fi
               done
             done 3< out/bundle/upload.txt
           else
@@ -303,6 +310,14 @@ jobs:
             echo "raw covr bundles were held back or failed to upload for shard ${SHARD_INDEX}; the shard DB is already published" >&2
             exit 1
           fi
+      - name: Keep raw bundles whose upload did not finish
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: covr-raw-unsent-s${{ matrix.index }}-attempt-${{ github.run_attempt }}
+          path: out/unsent/
+          if-no-files-found: ignore
+          retention-days: 90
 
   # Fold the per-runner shard databases (from the internal prerelease) into the
   # canonical cran-coverage.db that consumers read on the public release, and

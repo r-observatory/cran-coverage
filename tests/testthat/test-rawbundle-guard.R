@@ -95,7 +95,7 @@ test_that("a successful download is extracted and a grown bundle uploads", {
   c_row <- plan[plan$name == paste0(PFX, "c.tar.gz"), ]
   expect_true(c_row$upload)
   expect_identical(c(c_row$prior, c_row$new, c_row$dropped), c(2L, 3L, 0L))
-  expect_true(all(plan$upload))
+  expect_false(any(plan$held))
 })
 
 test_that("a download that keeps failing is not extracted and its bundle is held back", {
@@ -118,8 +118,9 @@ test_that("a download that keeps failing is not extracted and its bundle is held
   bundle_partitions("out/raw", "out/bundle", prefix = PFX)
   plan <- plan_raw_uploads("out/bundle", st, 1L, 4L, PFX)
   expect_false(plan$upload[plan$name == c_name])
+  expect_true(plan$held[plan$name == c_name])
   expect_match(plan$reason[plan$name == c_name], "could not be downloaded")
-  expect_true(plan$upload[plan$name == d_name])
+  expect_false(plan$held[plan$name == d_name])
 })
 
 test_that("a download that fails once is retried and then used", {
@@ -150,6 +151,7 @@ test_that("a rebuilt bundle missing objects for packages still in the shard is r
   plan <- plan_raw_uploads("out/bundle", st, 1L, 4L, PFX)
   row <- plan[plan$name == c_name, ]
   expect_false(row$upload)
+  expect_true(row$held)
   expect_identical(c(row$prior, row$new, row$dropped, row$left_shard), c(4L, 2L, 3L, 0L))
   expect_match(row$reason, "still in this shard")
 })
@@ -210,6 +212,7 @@ test_that("prepare_raw_upload retries a held-back prior, and uploads nothing wit
                               PFX, 1L, 4L, fake_download(rel$dir), pause = no_pause)
   expect_true(nrow(plan2) > 0L)
   expect_false(any(plan2$upload))
+  expect_true(all(plan2$held))
 })
 
 test_that("shard_bundle_sizes reads this shard's bundles from the release listing", {
@@ -223,4 +226,53 @@ test_that("shard_bundle_sizes reads this shard's bundles from the release listin
   g <- tempfile(fileext = ".json")
   writeLines('{"assets":[]}', g)
   expect_length(shard_bundle_sizes(g, PFX), 0L)
+})
+
+test_that("an unchanged bundle is skipped, neither uploaded nor held back", {
+  rel <- make_release(c("cards_0.9.0", "casebase_0.10.7", "dplyr_1.1.4"))
+  c_name <- paste0(PFX, "c.tar.gz"); d_name <- paste0(PFX, "d.tar.gz")
+  root <- tempfile("run_"); dir.create(root)
+  withr::local_dir(root)
+  st <- fetch_prior_bundles(rel$sizes, "out/rawbundles", fake_download(rel$dir),
+                            pause = no_pause)
+  # Nothing new is measured, so neither bundle needs replacing.
+  bundle_partitions("out/raw", "out/bundle", prefix = PFX)
+  plan <- plan_raw_uploads("out/bundle", st, 1L, 4L, PFX)
+  expect_setequal(plan$name, c(c_name, d_name))
+  expect_false(any(plan$upload))
+  expect_false(any(plan$held))
+  expect_match(plan$reason, "unchanged")
+  row <- plan[plan$name == c_name, ]
+  expect_identical(c(row$prior, row$new, row$dropped), c(2L, 2L, 0L))
+})
+
+test_that("a bundle whose object was rewritten under the same name still uploads", {
+  rel <- make_release(c("cards_0.9.0", "casebase_0.10.7"))
+  c_name <- paste0(PFX, "c.tar.gz")
+  root <- tempfile("run_"); dir.create(root)
+  withr::local_dir(root)
+  st <- fetch_prior_bundles(rel$sizes, "out/rawbundles", fake_download(rel$dir),
+                            pause = no_pause)
+  write_raw_object("out/raw", "cards", "0.9.0", serialize("remeasured", NULL))
+  bundle_partitions("out/raw", "out/bundle", prefix = PFX)
+  plan <- plan_raw_uploads("out/bundle", st, 1L, 4L, PFX)
+  row <- plan[plan$name == c_name, ]
+  expect_true(row$upload)
+  expect_false(row$held)
+  expect_identical(c(row$prior, row$new, row$dropped), c(2L, 2L, 0L))
+})
+
+test_that("prepare_raw_upload skips a bundle refetched intact that did not change", {
+  rel <- make_release(c("cards_0.9.0", "dplyr_1.1.4"))
+  c_name <- paste0(PFX, "c.tar.gz"); d_name <- paste0(PFX, "d.tar.gz")
+  root <- tempfile("run_"); dir.create(root)
+  withr::local_dir(root)
+  st <- fetch_prior_bundles(rel$sizes, "out/rawbundles",
+                            fake_download(rel$dir, fail = c_name),
+                            attempts = 1L, pause = no_pause)
+  saveRDS(st, "out/rawbundles/prior-state.rds")
+  plan <- prepare_raw_upload("out/rawbundles/prior-state.rds", "out/raw", "out/bundle",
+                             PFX, 1L, 4L, fake_download(rel$dir), pause = no_pause)
+  expect_false(any(plan$upload))
+  expect_false(any(plan$held))
 })
