@@ -269,6 +269,11 @@ jobs:
             fi
             if [ "$SECONDS" -ge "$BUDGET" ]; then break; fi
           done
+          # This leg's queued re-measures (data/requeue/requeue.tsv), for the run summary.
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -f out/manifest.json ]; then
+            jq -r --arg s "$SHARD_INDEX" '.requeue // empty | "Shard \($s) queued re-measures: \(.queued) queued at the start of the run, \(.measured) measured, \(.failed) failed, \(.left) left (\(.capped) at the failure cap)."' \
+              out/manifest.json >> "$GITHUB_STEP_SUMMARY" || true
+          fi
           # Bundle and upload raw covr objects once, after the loop (API budget).
           # An unchanged bundle is skipped. One whose prior copy was not fetched
           # whole, or that would drop objects, is held back; that or a failed
@@ -491,6 +496,19 @@ jobs:
             man <- list(processed = total,
                         remaining = if (is.na(remaining)) NA else remaining,
                         generated_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"))
+            # Queued re-measures (data/requeue/requeue.tsv), summed over the shards for this run.
+            rq <- tryCatch(requeue_totals(
+              list.files("shards", pattern = "^cran-coverage-shard-.*[.]db$", full.names = TRUE),
+              Sys.getenv("GITHUB_RUN_ID", "local")), error = function(e) NULL)
+            if (!is.null(rq)) {
+              man$requeue <- rq
+              line <- sprintf("Queued re-measures: %d queued at the start of the run, %d measured, %d failed, %d left (%d at the failure cap).",
+                              rq$queued, rq$measured, rq$failed, rq$left, rq$capped)
+              message(line)
+              if (nzchar(Sys.getenv("GITHUB_STEP_SUMMARY"))) {
+                cat(line, "\n", file = Sys.getenv("GITHUB_STEP_SUMMARY"), sep = "", append = TRUE)
+              }
+            }
             # Integrity/completeness core for the canonical published database
             # asset (cran-coverage.db). Prefer the fresh copy the merge step
             # published this run; if that step refused to publish (fewer rows
