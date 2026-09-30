@@ -214,6 +214,202 @@ bundle_partitions <- function(dir, out_dir, prefix = "covr-raw-") {
   }
 }
 
+# Replacing a raw bundle on the release is destructive (--clobber), so a
+# rebuilt bundle may only go up when the prior copy was fetched whole and every
+# object it held is still in the rebuilt one.
+
+#' Raw objects (.rds members) a bundle holds, or NULL when the file is
+#' missing, differs from the size the release lists, or does not read as a
+#' tarball (a transfer that broke midway leaves a short file behind).
+#'
+#' @param path Bundle file.
+#' @param size Size in bytes the release lists for it, or NA to skip that check.
+#' @return Character vector of member paths, or NULL.
+bundle_members <- function(path, size = NA_real_) {
+  if (!file.exists(path)) return(NULL)
+  if (!is.na(size) && !isTRUE(file.size(path) == size)) return(NULL)
+  m <- tryCatch(utils::untar(path, list = TRUE, tar = "internal"),
+                error = function(e) NULL)
+  if (is.null(m)) return(NULL)
+  m[grepl("\\.rds$", m)]
+}
+
+#' This shard's raw bundles on the internal release, from a saved
+#' `gh release view --json assets` listing.
+#'
+#' @param path   JSON file holding the listing.
+#' @param prefix Bundle name prefix for this shard, e.g. "covr-raw-s1-".
+#' @return Named numeric vector: asset name -> size in bytes.
+shard_bundle_sizes <- function(path, prefix) {
+  a <- jsonlite::fromJSON(path)$assets
+  if (!is.data.frame(a) || nrow(a) == 0L) {
+    return(stats::setNames(numeric(0), character(0)))
+  }
+  keep <- startsWith(a$name, prefix) & endsWith(a$name, ".tar.gz")
+  stats::setNames(as.numeric(a$size[keep]), a$name[keep])
+}
+
+#' Download and extract this shard's prior raw bundles, failing closed.
+#'
+#' Bundles that do not verify (see bundle_members) are retried up to
+#' `attempts` times. Only verified bundles are extracted; the rest are
+#' reported as unavailable so their rebuilt copies are not uploaded over the
+#' intact ones on the release.
+#'
+#' @param expected Named numeric vector: asset name -> size on the release.
+#' @param dir      Directory to download into.
+#' @param download function(names, dir) fetching those assets into dir.
+#' @param exdir    Where to extract (members are relative out/raw/... paths).
+#' @param attempts Download attempts per bundle.
+#' @param pause    function(n) called before retry n.
+#' @return list(expected, members = named list of member paths per verified
+#'   bundle, unavailable = names never fetched whole).
+fetch_prior_bundles <- function(expected, dir, download, exdir = ".",
+                                attempts = 3L,
+                                pause = function(n) Sys.sleep(30 * n)) {
+  dir.create(dir, showWarnings = FALSE, recursive = TRUE)
+  members <- list()
+  pending <- names(expected)
+  for (attempt in seq_len(attempts)) {
+    if (length(pending) == 0L) break
+    if (attempt > 1L) {
+      message(sprintf("retrying %d raw bundle(s) (attempt %d of %d): %s",
+                      length(pending), attempt, attempts,
+                      paste(pending, collapse = " ")))
+      pause(attempt - 1L)
+    }
+    # gh writes straight to the destination, so clear any short leftovers.
+    unlink(file.path(dir, pending))
+    tryCatch(download(pending, dir), error = function(e)
+      message("raw bundle download failed: ", conditionMessage(e)))
+    for (n in pending) {
+      m <- bundle_members(file.path(dir, n), expected[[n]])
+      if (!is.null(m)) members[[n]] <- m
+    }
+    pending <- setdiff(pending, names(members))
+  }
+  for (n in names(members)) {
+    ok <- tryCatch({
+      utils::untar(file.path(dir, n), exdir = exdir, tar = "internal")
+      all(file.exists(file.path(exdir, members[[n]])))
+    }, error = function(e) FALSE)
+    if (!ok) {
+      members[[n]] <- NULL
+      pending <- c(pending, n)
+    }
+  }
+  for (n in pending) {
+    message(sprintf("prior raw bundle %s could not be downloaded intact", n))
+  }
+  list(expected = expected, members = members, unavailable = pending)
+}
+
+#' Decide which rebuilt raw bundles may replace the copies on the release.
+#'
+#' A bundle is held back when its prior copy is on the release but was not
+#' fetched intact, or when it lacks an object the prior copy held for a
+#' package that still partitions to this shard. Objects for packages that
+#' moved to another shard may be dropped. Needs package_partition (update.R).
+#'
+#' @param bundle_dir  Directory holding the rebuilt bundles.
+#' @param prior       Result of fetch_prior_bundles().
+#' @param shard_index This runner's partition index.
+#' @param shard_count Total number of partitions.
+#' @param prefix      Bundle name prefix for this shard.
+#' @return data.frame(name, prior, new, dropped, left_shard, upload, reason).
+plan_raw_uploads <- function(bundle_dir, prior, shard_index, shard_count, prefix) {
+  files <- list.files(bundle_dir, full.names = TRUE)
+  files <- files[startsWith(basename(files), prefix) & endsWith(files, ".tar.gz")]
+  rows <- lapply(files, function(f) {
+    name <- basename(f)
+    row <- function(p, nw, d, l, up, why) data.frame(
+      name = name, prior = as.integer(p), new = as.integer(nw),
+      dropped = as.integer(d), left_shard = as.integer(l), upload = up,
+      reason = why, stringsAsFactors = FALSE)
+    new_m <- bundle_members(f)
+    if (is.null(new_m)) return(row(NA, NA, NA, NA, FALSE, "rebuilt bundle is unreadable"))
+    known <- name %in% names(prior$expected)
+    old_m <- prior$members[[name]]
+    if (name %in% prior$unavailable || (known && is.null(old_m))) {
+      return(row(NA, length(new_m), NA, NA, FALSE,
+                 "prior bundle on the release could not be downloaded intact"))
+    }
+    if (is.null(old_m)) old_m <- character(0)
+    dropped <- setdiff(basename(old_m), basename(new_m))
+    moved <- package_partition(sub("_.*$", "", dropped), shard_count) != shard_index
+    if (any(!moved)) {
+      return(row(length(old_m), length(new_m), length(dropped), sum(moved), FALSE,
+                 sprintf("would drop %d object(s) for packages still in this shard",
+                         sum(!moved))))
+    }
+    row(length(old_m), length(new_m), length(dropped), sum(moved), TRUE,
+        if (known) "prior objects all kept" else "new bundle")
+  })
+  if (length(rows) == 0L) {
+    return(data.frame(name = character(0), prior = integer(0), new = integer(0),
+                      dropped = integer(0), left_shard = integer(0),
+                      upload = logical(0), reason = character(0)))
+  }
+  do.call(rbind, rows)
+}
+
+#' Rebuild this shard's raw bundles and choose which may be uploaded.
+#'
+#' Prior bundles that were unavailable at the start of the run get one more
+#' fetch first; when that works their objects join the local store, so this
+#' run's new objects still go up with them. Without a record of the start of
+#' run fetch, nothing is uploaded.
+#'
+#' @param state_path Where the download step saved fetch_prior_bundles().
+#' @param raw_dir    Local raw object store.
+#' @param bundle_dir Where to write the rebuilt bundles.
+#' @param prefix, shard_index, shard_count As in plan_raw_uploads().
+#' @param download, exdir, attempts, pause As in fetch_prior_bundles().
+#' @return The plan_raw_uploads() data.frame; each row is also logged.
+prepare_raw_upload <- function(state_path, raw_dir, bundle_dir, prefix,
+                               shard_index, shard_count, download, exdir = ".",
+                               attempts = 2L,
+                               pause = function(n) Sys.sleep(30 * n)) {
+  prior <- if (file.exists(state_path)) readRDS(state_path) else NULL
+  if (!is.null(prior) && length(prior$unavailable)) {
+    again <- fetch_prior_bundles(prior$expected[prior$unavailable], dirname(state_path),
+                                 download, exdir = exdir, attempts = attempts,
+                                 pause = pause)
+    prior$members <- c(prior$members, again$members)
+    prior$unavailable <- again$unavailable
+  }
+  if (dir.exists(raw_dir)) bundle_partitions(raw_dir, bundle_dir, prefix = prefix)
+  if (is.null(prior)) {
+    message("no record of which prior raw bundles were fetched; uploading none")
+    prior <- list(expected = stats::setNames(numeric(0), character(0)),
+                  members = list(), unavailable = character(0))
+    plan <- plan_raw_uploads(bundle_dir, prior, shard_index, shard_count, prefix)
+    plan$upload <- FALSE
+    plan$reason <- "no record of the prior bundle fetch"
+  } else {
+    plan <- plan_raw_uploads(bundle_dir, prior, shard_index, shard_count, prefix)
+  }
+  for (i in seq_len(nrow(plan))) {
+    message(sprintf("%s: prior %s, rebuilt %s, dropped %s (%s left the shard) -> %s (%s)",
+                    plan$name[i], plan$prior[i], plan$new[i], plan$dropped[i],
+                    plan$left_shard[i], if (plan$upload[i]) "upload" else "HOLD",
+                    plan$reason[i]))
+  }
+  plan
+}
+
+#' Downloader for fetch_prior_bundles(): one `gh release download` call for
+#' all the named assets of `tag`.
+gh_release_downloader <- function(tag) {
+  function(names, dir) {
+    args <- c("release", "download", tag, "--dir", dir,
+              as.vector(rbind("--pattern", names)))
+    status <- system2("gh", args)
+    if (!identical(as.integer(status), 0L)) stop(sprintf("gh exited %s", status))
+    invisible(TRUE)
+  }
+}
+
 #' Merge per-shard coverage databases into one canonical database.
 #'
 #' Matrix runners each publish their own cran-coverage-shard-<i>.db so no
