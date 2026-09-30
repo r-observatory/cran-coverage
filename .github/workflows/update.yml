@@ -143,7 +143,8 @@ jobs:
           # Read asset lists into variables first: with -e, a transient
           # `gh release view` failure aborts the step (the run just retries next
           # tick) instead of being misread as "no prior state" and restarting.
-          ASSETS_INT=$(gh release view "$INTERNAL_TAG" --json assets -q '.assets[].name')
+          INT_JSON=$(gh release view "$INTERNAL_TAG" --json assets)
+          ASSETS_INT=$(printf '%s\n' "$INT_JSON" | jq -r '.assets[].name')
           ASSETS_PUB=$(gh release view "$PUBLIC_TAG" --json assets -q '.assets[].name')
           # Resume state (shard database) lives on the internal prerelease.
           if echo "$ASSETS_INT" | grep -qx "$SHARD_ASSET"; then
@@ -173,13 +174,21 @@ jobs:
             echo "seeded shard ${SHARD_INDEX} from the canonical DB: ${PRIOR_ROWS} rows"
           fi
           echo "$PRIOR_ROWS" > out/.prior_rows
-          # Raw covr objects for this runner also live on the internal prerelease
-          # (best-effort; never destructive to the DB).
+          # Raw covr bundles: extract only those fetched whole and record the rest,
+          # so the upload after the loop leaves them alone (no record, no upload).
           mkdir -p out/rawbundles
-          gh release download "$INTERNAL_TAG" --pattern "covr-raw-s${SHARD_INDEX}-*.tar.gz" --dir out/rawbundles 2>/dev/null || true
-          for f in out/rawbundles/covr-raw-s"${SHARD_INDEX}"-*.tar.gz; do
-            if [ -f "$f" ]; then tar xzf "$f" || true; fi
-          done
+          printf '%s\n' "$INT_JSON" > out/rawbundles/internal-assets.json
+          Rscript -e '
+            source("scripts/export.R")
+            pfx <- paste0("covr-raw-s", Sys.getenv("SHARD_INDEX"), "-")
+            st <- fetch_prior_bundles(
+              shard_bundle_sizes("out/rawbundles/internal-assets.json", pfx),
+              "out/rawbundles", gh_release_downloader(Sys.getenv("INTERNAL_TAG")))
+            saveRDS(st, "out/rawbundles/prior-state.rds")
+            cat(sprintf("prior raw bundles: %d on the release, %d fetched intact, %d unavailable\n",
+                        length(st[["expected"]]), length(st[["members"]]),
+                        length(st[["unavailable"]])))
+          ' || echo "::warning::raw bundle fetch failed for shard ${SHARD_INDEX}; no raw bundle will be uploaded this run"
       - name: Run shards until the budget
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -260,14 +269,40 @@ jobs:
             fi
             if [ "$SECONDS" -ge "$BUDGET" ]; then break; fi
           done
-          # Bundle and upload this runner's raw covr objects ONCE, after the loop.
-          # Moving this out of the per-iteration publish is the single largest cut
-          # to API usage. Best-effort: the shard DB above already banked the
-          # coverage numbers, so never fail the run over the secondary raw store.
-          Rscript -e 'source("scripts/export.R"); bundle_partitions("out/raw", "out/bundle", prefix = paste0("covr-raw-s", Sys.getenv("SHARD_INDEX"), "-"))' || true
-          for f in out/bundle/covr-raw-s"${SHARD_INDEX}"-*.tar.gz; do
-            if [ -f "$f" ]; then gh release upload "$INTERNAL_TAG" "$f" --clobber || true; fi
-          done
+          # Bundle and upload raw covr objects once, after the loop (API budget).
+          # A bundle whose prior copy was not fetched whole, or that would drop
+          # objects, is held back; that or a failed upload fails the leg last.
+          rm -f out/bundle/upload.txt out/bundle/held.txt
+          Rscript -e '
+            for (s in c("config.R", "export.R", "update.R")) source(file.path("scripts", s))
+            idx <- Sys.getenv("SHARD_INDEX")
+            plan <- prepare_raw_upload("out/rawbundles/prior-state.rds", "out/raw", "out/bundle",
+                                       paste0("covr-raw-s", idx, "-"), as.integer(idx),
+                                       as.integer(Sys.getenv("SHARD_COUNT")),
+                                       gh_release_downloader(Sys.getenv("INTERNAL_TAG")))
+            up <- plan[["upload"]]; nm <- plan[["name"]]; why <- plan[["reason"]]
+            for (i in which(!up)) cat(sprintf("::warning::holding back %s: %s\n", nm[i], why[i]))
+            writeLines(nm[!up], "out/bundle/held.txt")
+            writeLines(nm[up], "out/bundle/upload.txt")
+          ' || echo "::warning::raw bundle planning failed for shard ${SHARD_INDEX}; no raw bundle uploaded this run"
+          raw_failed=0
+          if [ -f out/bundle/upload.txt ]; then
+            # Read the list on fd 3 so gh cannot consume it from stdin.
+            while IFS= read -r name <&3; do
+              [ -n "$name" ] || continue
+              # gh deletes the old asset first, so retry rather than leave it gone.
+              for attempt in 1 2 3; do
+                if gh release upload "$INTERNAL_TAG" "out/bundle/$name" --clobber; then break; fi
+                if [ "$attempt" -eq 3 ]; then echo "::warning::upload of ${name} failed"; raw_failed=1; else sleep $((attempt * 30)); fi
+              done
+            done 3< out/bundle/upload.txt
+          else
+            raw_failed=1
+          fi
+          if [ "$raw_failed" -ne 0 ] || [ -s out/bundle/held.txt ]; then
+            echo "raw covr bundles were held back or failed to upload for shard ${SHARD_INDEX}; the shard DB is already published" >&2
+            exit 1
+          fi
 
   # Fold the per-runner shard databases (from the internal prerelease) into the
   # canonical cran-coverage.db that consumers read on the public release, and

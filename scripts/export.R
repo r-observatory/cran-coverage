@@ -378,6 +378,7 @@ prepare_raw_upload <- function(state_path, raw_dir, bundle_dir, prefix,
     prior$members <- c(prior$members, again$members)
     prior$unavailable <- again$unavailable
   }
+  dir.create(bundle_dir, showWarnings = FALSE, recursive = TRUE)
   if (dir.exists(raw_dir)) bundle_partitions(raw_dir, bundle_dir, prefix = prefix)
   if (is.null(prior)) {
     message("no record of which prior raw bundles were fetched; uploading none")
@@ -389,10 +390,11 @@ prepare_raw_upload <- function(state_path, raw_dir, bundle_dir, prefix,
   } else {
     plan <- plan_raw_uploads(bundle_dir, prior, shard_index, shard_count, prefix)
   }
+  n <- function(x) ifelse(is.na(x), "?", as.character(x))
   for (i in seq_len(nrow(plan))) {
     message(sprintf("%s: prior %s, rebuilt %s, dropped %s (%s left the shard) -> %s (%s)",
-                    plan$name[i], plan$prior[i], plan$new[i], plan$dropped[i],
-                    plan$left_shard[i], if (plan$upload[i]) "upload" else "HOLD",
+                    plan$name[i], n(plan$prior[i]), n(plan$new[i]), n(plan$dropped[i]),
+                    n(plan$left_shard[i]), if (plan$upload[i]) "upload" else "HOLD",
                     plan$reason[i]))
   }
   plan
