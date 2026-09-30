@@ -49,6 +49,15 @@ test_that("read_requeue refuses missing columns, blank fields and repeated rows"
   expect_error(read_requeue(f), "more than once")
 })
 
+test_that("the committed requeue list reads cleanly and skips the restored objects", {
+  q <- read_requeue(test_path("..", "..", "data", "requeue", "requeue.tsv"))
+  expect_gt(nrow(q), 0L)
+  expect_identical(anyDuplicated(q$package), 0L)
+  restored <- read_restore_manifest(test_path("..", "..", "data", "restore",
+                                              "restore-manifest.tsv"))
+  expect_length(intersect(paste(q$package, q$version), paste(restored$package, restored$version)), 0L)
+})
+
 # --- requeue_state ---------------------------------------------------------------
 
 test_that("a queued row is due only while its version is the current CRAN version", {
